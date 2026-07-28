@@ -1,8 +1,11 @@
 # syntax=docker/dockerfile:1
 
-# Matches .python-version — App Runner builds this image directly from the
-# GitHub repo via its own Docker build step (no separate Nixpacks/buildpack
-# auto-detection to keep in sync, unlike the Railway setup this replaces).
+# Matches .python-version. Unlike App Runner (which could build straight
+# from a connected GitHub repo), ECS Express Mode only accepts an
+# already-built image URI — this image is built and pushed to ECR by the
+# GitHub Actions workflow in .github/workflows/deploy.yml, which then points
+# an Express Mode service at it. Nothing about the image itself changes
+# between hosting platforms — same base, same layers, same CMD.
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -17,8 +20,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # build context, so this doesn't pull them into the image.
 COPY . .
 
-# App Runner routes traffic to a single port set in its own service config
-# (Console → your service → Configuration → Port), not via an env var — that
-# setting MUST be 8000 to match what's hardcoded here.
+# ECS Express Mode routes traffic to a single "Container port" set on the
+# service (defaults to 80 if unset!) — the deploy workflow passes
+# container-port: 8000 explicitly to the deploy action so it matches what's
+# hardcoded here; if configuring a service by hand in the console instead,
+# set Container port to 8000 there too.
 EXPOSE 8000
 CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
