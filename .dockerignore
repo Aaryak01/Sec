@@ -1,0 +1,16 @@
+# Keeps the Docker build context small and secrets out of the image.
+
+__pycache__/
+*.pyc
+.env
+*.db
+.git/
+.gitignore
+.claude/
+
+# Unused by app.py/api.py at runtime (confirmed via grep before excluding)
+# and together ~580MB — same dead weight identified during the earlier
+# Railway prep, still irrelevant here:
+checkpoints/
+tokenizer/
+gemini-for-claude-code/

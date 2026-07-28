@@ -1,0 +1,19 @@
+gradio
+cohere
+httpx
+python-dotenv
+scikit-learn
+pandas
+matplotlib
+numpy
+fastapi
+# [standard] pulls in uvloop/httptools for real production throughput —
+# matters once this runs on a hosting platform instead of local dev.
+uvicorn[standard]
+pyjwt[crypto]
+# boto3 talks to DynamoDB (conversation persistence) using AWS credentials
+# resolved from the default provider chain — env vars (AWS_ACCESS_KEY_ID /
+# AWS_SECRET_ACCESS_KEY) set on the hosting platform in production, or the
+# AWS CLI credentials already configured on this machine for local dev. No
+# keys are stored here.
+boto3

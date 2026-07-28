@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+*.db
+checkpoints/
+tokenizer/
+gemini-for-claude-code/
+.claude/
