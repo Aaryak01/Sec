@@ -122,7 +122,12 @@ def detect_companies(text: str) -> list[str]:
     hits = []
     for key, aliases in COMPANY_ALIASES.items():
         for alias in aliases:
-            m = re.search(rf"\b{re.escape(alias)}\b", text_l)
+            # '?s? tolerates a trailing possessive/plural with or without the
+            # apostrophe ("Tesla's" and "teslas" should both resolve) — \b
+            # alone only closes on a non-word character, so "teslas" typed
+            # as one word never matched "tesla" at all: no boundary exists
+            # between the "a" and the "s" that follows it.
+            m = re.search(rf"\b{re.escape(alias)}'?s?\b", text_l)
             if m:
                 hits.append((m.start(), key))
                 break
@@ -220,6 +225,38 @@ _STOCK_CHART_PATTERNS = ["show me", "graph", "chart", "trend"]
 
 def _wants_stock_chart(text_l: str) -> bool:
     return wants_chart(text_l) or any(p in text_l for p in _STOCK_CHART_PATTERNS)
+
+
+_COMPARE_RE = re.compile(r"\bcompar\w*\b|\bvs\.?\b|\bversus\b")
+
+
+def _wants_stock_comparison(text_l: str) -> bool:
+    return bool(_COMPARE_RE.search(text_l))
+
+
+def _resolve_stock_comparison_companies(text_l: str, companies: list[str], history) -> list[str] | None:
+    """Two companies to compare, or None if this isn't a stock comparison.
+
+    Handles both "compare Tesla and Apple's stock price" (both companies
+    already in `companies`) and a bare follow-up like "now compare it with
+    Apple's stock price" — only Apple is named in that message, so
+    `companies` here is just ["apple"] (the top-level carry-forward in
+    route_message only fills in a company when NONE is named in the current
+    message, and a comparison follow-up always names one: the new side of
+    the comparison). "it" still needs resolving to whichever company the
+    conversation was actually discussing, the same way _carry_forward_company
+    resolves "it" elsewhere — just not short-circuited here by a company
+    already being present.
+    """
+    if not _wants_stock_comparison(text_l):
+        return None
+    if len(companies) >= 2:
+        return companies[:2]
+    if len(companies) == 1 and history:
+        carried = _carry_forward_company(history)
+        if carried and carried != companies[0]:
+            return [carried, companies[0]]
+    return None
 
 
 def wants_risk_section(text_l: str) -> bool:
@@ -1060,6 +1097,11 @@ INVESTING_LITERACY = {
         "signal": "Because of that, stock price can move independently of the underlying business for long stretches. If revenue is growing but the stock price is flat or falling, the market may have already priced in that growth, or may be more worried about something else (competition, margins, macro conditions) than it is impressed by the growth. A rising stock price without matching revenue growth often means the opposite: investors are pricing in future growth that hasn't shown up in the numbers yet.",
         "follow_up": "Worth checking: has this company's revenue growth kept pace with its stock price, or have the two drifted apart?",
     },
+    "stock_comparison": {
+        "explanation": "Comparing two companies' stock performance shows how the market has treated them differently over the same period.",
+        "signal": "Check whether the difference reflects genuinely different business fundamentals (revenue, margins) or broader market/sector sentiment that's affecting one company more than the other. Two companies in the same industry often move together on sector-wide news even when their own numbers are diverging.",
+        "follow_up": "Do these two companies' revenue growth rates diverge the same way their stock prices do, or has the market moved one more than the fundamentals justify?",
+    },
 }
 
 METRIC_LITERACY_KEY = {
@@ -1812,16 +1854,27 @@ def stock_price_chart_path(company: str, series: pd.DataFrame):
     return path
 
 
-def stock_price_summary(company: str, series: pd.DataFrame) -> str:
-    name = COMPANY_DISPLAY.get(company, company.capitalize())
+def _stock_price_stats(series: pd.DataFrame):
+    """(latest_date, latest_close, prior_close, pct_change) — prior_close/
+    pct_change are None if there's no data from ~a year before the latest
+    close. Shared by the single-company and comparison summaries so the
+    "a year ago" lookup logic exists in exactly one place."""
     latest = series.iloc[-1]
     latest_date, latest_close = latest["date"], latest["close_price"]
+    prior = series[series["date"] <= latest_date - pd.Timedelta(days=365)]
+    if prior.empty:
+        return latest_date, latest_close, None, None
+    prior_close = prior.iloc[-1]["close_price"]
+    pct_change = (latest_close - prior_close) / prior_close * 100
+    return latest_date, latest_close, prior_close, pct_change
+
+
+def stock_price_summary(company: str, series: pd.DataFrame) -> str:
+    name = COMPANY_DISPLAY.get(company, company.capitalize())
+    latest_date, latest_close, prior_close, pct_change = _stock_price_stats(series)
 
     sentence = f"{name}'s stock closed at ${latest_close:,.2f} on {latest_date.date()}"
-    prior = series[series["date"] <= latest_date - pd.Timedelta(days=365)]
-    if not prior.empty:
-        prior_close = prior.iloc[-1]["close_price"]
-        pct_change = (latest_close - prior_close) / prior_close * 100
+    if pct_change is not None:
         direction = "up" if pct_change >= 0 else "down"
         sentence += f", {direction} {abs(pct_change):.1f}% from a year ago (${prior_close:,.2f})"
     sentence += "."
@@ -1831,7 +1884,81 @@ def stock_price_summary(company: str, series: pd.DataFrame) -> str:
     return sentence
 
 
-def handle_stock_price(text_l: str, companies: list[str]) -> list:
+def stock_price_comparison_chart_path(
+    company_a: str, series_a: pd.DataFrame, company_b: str, series_b: pd.DataFrame
+):
+    name_a = COMPANY_DISPLAY.get(company_a, company_a.capitalize())
+    name_b = COMPANY_DISPLAY.get(company_b, company_b.capitalize())
+
+    fig, ax = plt.subplots(figsize=(7.5, 4), facecolor=CHART_BACKGROUND)
+    ax.set_facecolor(CHART_BACKGROUND)
+    # _CHART_COLORS (not a plain CHART_PRIMARY/CHART_HOVER pair) — those two
+    # are both dark navy and nearly indistinguishable on a line plot at this
+    # size, confirmed by rendering it. _CHART_COLORS is this app's existing,
+    # already-legible multi-series order (used by company_metric_chart_path
+    # for margin comparisons): navy, then a muted gray-purple, then the
+    # navy hover tint.
+    ax.plot(series_a["date"], series_a["close_price"], color=_CHART_COLORS[0], linewidth=1.5, label=name_a)
+    ax.plot(series_b["date"], series_b["close_price"], color=_CHART_COLORS[1], linewidth=1.5, label=name_b)
+    ax.set_title(f"Stock Price — {name_a} vs {name_b}", color=CHART_PRIMARY)
+    ax.set_xlabel("Date", color=CHART_TEXT)
+    ax.set_ylabel("Close Price ($)", color=CHART_TEXT)
+    ax.legend(facecolor=CHART_BACKGROUND, edgecolor=CHART_GRID, labelcolor=CHART_TEXT)
+    _style_axes(ax)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+
+    path = CHART_DIR / f"stock_price_compare_{uuid.uuid4().hex[:8]}.png"
+    fig.savefig(path, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return path
+
+
+def stock_price_comparison_summary(
+    company_a: str, series_a: pd.DataFrame, company_b: str, series_b: pd.DataFrame
+) -> str:
+    name_a = COMPANY_DISPLAY.get(company_a, company_a.capitalize())
+    name_b = COMPANY_DISPLAY.get(company_b, company_b.capitalize())
+    _, close_a, _, pct_a = _stock_price_stats(series_a)
+    _, close_b, _, pct_b = _stock_price_stats(series_b)
+
+    def _change_clause(pct):
+        if pct is None:
+            return "no year-ago data available"
+        direction = "up" if pct >= 0 else "down"
+        return f"{direction} {abs(pct):.1f}% over the past year"
+
+    sentence = f"{name_a} is {_change_clause(pct_a)} while {name_b} is {_change_clause(pct_b)}"
+    if pct_a is not None and pct_b is not None and pct_a != pct_b:
+        leader, trailer = (name_a, name_b) if pct_a > pct_b else (name_b, name_a)
+        degree = "significantly" if abs(pct_a - pct_b) >= 10 else "modestly"
+        sentence += f" — {leader} has {degree} outperformed {trailer}'s stock over this period"
+    sentence += f" ({name_a}: ${close_a:,.2f}, {name_b}: ${close_b:,.2f})."
+
+    note = INVESTING_LITERACY["stock_comparison"]
+    sentence += f" {note['signal'].split('. ')[0]}. {note['follow_up']}"
+    return sentence
+
+
+def handle_stock_price_comparison(company_a: str, company_b: str) -> list:
+    name_a = COMPANY_DISPLAY.get(company_a, company_a.capitalize())
+    name_b = COMPANY_DISPLAY.get(company_b, company_b.capitalize())
+    series_a = _stock_price_series(company_a)
+    series_b = _stock_price_series(company_b)
+    if series_a.empty or series_b.empty:
+        missing = name_a if series_a.empty else name_b
+        return [f"I don't have stock price data for {missing}." + _suggestions()]
+    return [
+        stock_price_comparison_chart_path(company_a, series_a, company_b, series_b),
+        stock_price_comparison_summary(company_a, series_a, company_b, series_b),
+    ]
+
+
+def handle_stock_price(text_l: str, companies: list[str], history=None) -> list:
+    compare_pair = _resolve_stock_comparison_companies(text_l, companies, history)
+    if compare_pair:
+        return handle_stock_price_comparison(*compare_pair)
+
     if not companies:
         return ["Which company's stock price would you like to see? Try naming one, e.g. \"What is Apple's stock price?\""]
     company = companies[0]
@@ -3361,16 +3488,34 @@ def route_message(message: str, history: list = None):
     # _chart_series_selection matches "stock price") — silently substituting
     # a different metric for the one actually asked about.
     if wants_stock_price(text_l):
-        return handle_stock_price(text_l, companies)
+        return handle_stock_price(text_l, companies, history)
 
-    # A vague chart follow-up ("make a graph of it") after a stock price
-    # question has none of STOCK_PRICE_PATTERNS' words for wants_stock_price()
-    # above to match on its own — carry the topic forward the same way
-    # company/risk-section context already carries. Gated on
-    # detect_metric_column(text_l) being None so an explicit request for a
-    # different metric ("now graph revenue growth") isn't overridden.
-    if carry_stock_price and wants_chart(text_l) and detect_metric_column(text_l) is None:
-        return handle_stock_price(text_l, companies)
+    # A vague follow-up after a stock price question has none of
+    # STOCK_PRICE_PATTERNS' words for wants_stock_price() above to match on
+    # its own — carry the topic forward the same way company/risk-section
+    # context already carries. Three shapes this takes: a chart follow-up
+    # ("make a graph of it"), a bare company-name reply to
+    # handle_stock_price's own "which company's stock price...?" clarifying
+    # question ("Tesla's" — names a company but, once stopwords/the company
+    # name are stripped, has no topic left, which _extract_topic flags as
+    # "that" and would otherwise fall into the general company-overview
+    # branch further down), and a comparison follow-up ("now compare it to
+    # Apple" — no "stock" word of its own, and "compare" is itself one of
+    # METRICS_INTENT_PATTERNS, so without this check it falls straight into
+    # wants_metrics()'s generic revenue/margin overview instead. All three
+    # gated on detect_metric_column(text_l) being None so an explicit
+    # request for a different metric ("now graph revenue growth", "now
+    # compare it to Apple's revenue growth") isn't overridden.
+    if (
+        carry_stock_price
+        and detect_metric_column(text_l) is None
+        and (
+            wants_chart(text_l)
+            or _wants_stock_comparison(text_l)
+            or (companies and _extract_topic(message) == "that")
+        )
+    ):
+        return handle_stock_price(text_l, companies, history)
 
     if wants_chart(text_l):
         return handle_chart(text_l, companies)
