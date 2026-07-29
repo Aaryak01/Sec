@@ -21,6 +21,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Diagnostic: vars.* silently resolves to "" when unset/wrong-scoped,
+      # which produces a malformed ARN (empty account segment) and fails
+      # AssumeRoleWithWebIdentity with the same generic "not authorized"
+      # error as an actual trust-policy mismatch. Printing it here isn't a
+      # secret — it's just the target ARN — so it's safe to leave in.
+      - name: Print resolved role ARN
+        run: echo "Resolved role ARN -> arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/GitHubActionsECSDeployRole"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5
         with:
