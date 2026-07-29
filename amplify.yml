@@ -1,0 +1,31 @@
+version: 1
+# Explicit frontend-only build spec. Two reasons this file exists instead of
+# letting Amplify Hosting auto-generate one:
+#
+# 1. This repo has a leftover amplify/ Gen 2 backend folder (auth/resource.ts,
+#    backend.ts, data/resource.ts) from an abandoned `ampx sandbox` attempt —
+#    see the comment in src/components/ConfigureAmplify.tsx. Auth in this app
+#    is wired manually against a hand-created Cognito User Pool, not that
+#    scaffolding. Without this file, Amplify Hosting's auto-detection may see
+#    the amplify/ folder and try to add a backend deploy phase (`ampx
+#    pipeline-deploy`) for that unused/never-configured backend, which would
+#    fail the build. Committing our own frontend-only spec here means Amplify
+#    uses exactly this and skips that auto-detection.
+# 2. Pins the Next.js build output path explicitly (.next) rather than
+#    relying on inference.
+frontend:
+  phases:
+    preBuild:
+      commands:
+        - npm ci
+    build:
+      commands:
+        - npm run build
+  artifacts:
+    baseDirectory: .next
+    files:
+      - '**/*'
+  cache:
+    paths:
+      - node_modules/**/*
+      - .next/cache/**/*

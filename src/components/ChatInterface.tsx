@@ -1,46 +1,39 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
+import { getCurrentUser, signOut, fetchAuthSession } from "aws-amplify/auth";
 import ChatMessage from "./ChatMessage";
 import ChatSidebar from "./ChatSidebar";
-import RevenueChart from "./RevenueChart";
+import {
+  sendChatMessage,
+  listConversations,
+  getConversation,
+  saveConversation,
+  deleteConversation,
+  type ChatSource,
+  type HistoryTurn,
+} from "@/lib/chat-api";
 
-type Message = { question: string; answer: string; source?: string; chart?: boolean };
+type Message = {
+  question: string;
+  answer: string;
+  source?: string;
+  chartBase64?: string;
+};
 type Conversation = { id: string; title: string; messages: Message[] };
 
-// Same representative response patterns established for the hero demo —
-// metric lookup, filing search with a citation, chart-backed trend — reused
-// here so an example chip and a saved conversation both show something the
-// real product would actually say, not an idealized mockup.
-const EXAMPLE_QUESTIONS: Message[] = [
-  {
-    question: "What was Apple's revenue in FY 2025?",
-    answer:
-      "Apple reported $416.2B in revenue for FY 2025, up 6.4% from FY 2024.",
-    source: "Apple, 10-K — Financial Statements",
-  },
-  {
-    question: "What are Nvidia's biggest supply chain risks?",
-    answer:
-      "Nvidia's filings cite chip fabrication capacity as a primary supply chain concern, mentioned across multiple recent quarters.",
-    source: "Nvidia, 10-K — Item 1A",
-  },
-  {
-    question: "Show me Tesla's revenue trend.",
-    answer:
-      "Tesla's revenue peaked in FY 2024 before pulling back through FY 2025. A spike followed by a pullback can mean a one-time boost — a big deal, a demand surge — that didn't repeat, rather than an ongoing decline.",
-    chart: true,
-  },
+// Example prompts shown as clickable chips in the empty state — plain
+// strings now, not canned Q&A: clicking one sends a real question to the
+// real API, the same as typing it.
+const EXAMPLE_QUESTIONS = [
+  "What was Apple's revenue in FY 2025?",
+  "What are Nvidia's biggest supply chain risks?",
+  "Show me Tesla's revenue trend.",
 ];
 
-// No backend wired up yet, same as the sign-up form on the landing page — a
-// typed question that doesn't match one of the known examples gets an
-// honest placeholder rather than a fabricated answer.
-const PLACEHOLDER_ANSWER =
-  "This is a preview of the chat interface — real answers will be generated once the backend is connected.";
-
-// Mirrors the real product's actual constraints: a 5-saved-conversation cap
-// and ~40-character auto-generated titles.
+// Mirrors the real product's actual constraint: a 5-saved-conversation cap
+// (matches api.py's backend and the earlier Gradio app's storage.py).
 const MAX_SAVED_CONVERSATIONS = 5;
 const TITLE_MAX_LEN = 40;
 
@@ -50,34 +43,55 @@ function makeTitle(question: string): string {
     : question;
 }
 
-const SEED_CONVERSATIONS: Conversation[] = [
-  {
-    id: "seed-1",
-    title: makeTitle(EXAMPLE_QUESTIONS[0].question),
-    messages: [EXAMPLE_QUESTIONS[0]],
-  },
-  {
-    id: "seed-2",
-    title: makeTitle(EXAMPLE_QUESTIONS[1].question),
-    messages: [EXAMPLE_QUESTIONS[1]],
-  },
-];
+/** Flattens this conversation's Q&A pairs into the alternating user/assistant
+ * turns the API expects — matching exactly how api.py's own /chat handler
+ * reconstructs history (see the comment in api.py's chat() function): the
+ * turn currently being asked is NOT included here, since the caller appends
+ * it separately, mirroring app.py's bot_respond() convention. */
+function toHistory(messages: Message[]): HistoryTurn[] {
+  const turns: HistoryTurn[] = [];
+  for (const m of messages) {
+    turns.push({ role: "user", content: m.question });
+    turns.push({ role: "assistant", content: m.answer });
+  }
+  return turns;
+}
 
-function EmptyState({ onAsk }: { onAsk: (example: Message) => void }) {
+/** Inverse of toHistory() — pairs up alternating user/assistant turns loaded
+ * from the backend back into this component's question/answer shape. Charts
+ * and parsed sources are never persisted server-side (only role/content), so
+ * a reloaded conversation's messages never have chartBase64/source set. */
+function fromHistory(turns: HistoryTurn[]): Message[] {
+  const messages: Message[] = [];
+  for (let i = 0; i < turns.length; i += 2) {
+    messages.push({
+      question: turns[i]?.content ?? "",
+      answer: turns[i + 1]?.content ?? "",
+    });
+  }
+  return messages;
+}
+
+function formatSources(sources: ChatSource[] | null): string | undefined {
+  if (!sources || sources.length === 0) return undefined;
+  return sources.map((s) => s.raw).join("\n");
+}
+
+function EmptyState({ onAsk }: { onAsk: (question: string) => void }) {
   return (
     <div className="flex h-full flex-col items-center justify-center px-6 text-center">
       <p className="mb-6 text-lg text-foreground">
         Ask about a company&apos;s filings, risks, or financials
       </p>
       <div className="flex flex-wrap justify-center gap-2">
-        {EXAMPLE_QUESTIONS.map((example) => (
+        {EXAMPLE_QUESTIONS.map((question) => (
           <button
-            key={example.question}
+            key={question}
             type="button"
-            onClick={() => onAsk(example)}
+            onClick={() => onAsk(question)}
             className="cursor-pointer rounded-full border border-card-border bg-card px-4 py-2 text-sm text-foreground transition-colors hover:border-accent hover:bg-accent/5"
           >
-            {example.question}
+            {question}
           </button>
         ))}
       </div>
@@ -86,21 +100,66 @@ function EmptyState({ onAsk }: { onAsk: (example: Message) => void }) {
 }
 
 export default function ChatInterface() {
-  const [conversations, setConversations] = useState<Conversation[]>(SEED_CONVERSATIONS);
+  const router = useRouter();
+  const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [pending, setPending] = useState(false);
+  // null = still checking, so the real chat UI never flashes before a
+  // redirect for a genuinely signed-out visitor.
+  const [authorized, setAuthorized] = useState<boolean | null>(null);
+  const [accessToken, setAccessToken] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    getCurrentUser()
+      .then(async () => {
+        if (cancelled) return;
+        setAuthorized(true);
+        // Best-effort: if fetching the token or the saved-conversation list
+        // fails, the user is still signed in — the sidebar just starts
+        // empty rather than blocking the whole page on a redirect.
+        try {
+          const session = await fetchAuthSession();
+          const token = session.tokens?.accessToken?.toString();
+          if (!token || cancelled) return;
+          setAccessToken(token);
+          const list = await listConversations(token);
+          if (cancelled) return;
+          setConversations(
+            list.map((c) => ({ id: c.id, title: c.title, messages: [] }))
+          );
+        } catch {
+          // sidebar stays empty
+        }
+      })
+      .catch(() => {
+        if (!cancelled) router.replace("/");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [router]);
+
+  async function handleSignOut() {
+    await signOut();
+    router.push("/");
+  }
 
   const active = conversations.find((c) => c.id === activeId) ?? null;
 
-  function ask(message: Message) {
+  // Returns the conversation's id and its full message list after the
+  // append, so ask() can persist exactly what's now shown without racing
+  // React's batched state update.
+  function appendMessage(message: Message): { id: string; messages: Message[] } {
     if (activeId) {
+      const current = conversations.find((c) => c.id === activeId);
+      const messages = [...(current?.messages ?? []), message];
       setConversations((prev) =>
-        prev.map((c) =>
-          c.id === activeId ? { ...c, messages: [...c.messages, message] } : c
-        )
+        prev.map((c) => (c.id === activeId ? { ...c, messages } : c))
       );
-      return;
+      return { id: activeId, messages };
     }
     // Computed once, outside any setState updater, so both setters below
     // reference the same stable object — an id generated inside an updater
@@ -115,6 +174,52 @@ export default function ChatInterface() {
       [newConversation, ...prev].slice(0, MAX_SAVED_CONVERSATIONS)
     );
     setActiveId(newConversation.id);
+    return { id: newConversation.id, messages: newConversation.messages };
+  }
+
+  // Moves a just-saved conversation to the top of the sidebar list, mirroring
+  // the backend's updated_at-descending ordering without a full re-fetch.
+  function bumpToTop(id: string) {
+    setConversations((prev) => {
+      const idx = prev.findIndex((c) => c.id === id);
+      if (idx <= 0) return prev;
+      const copy = [...prev];
+      const [item] = copy.splice(idx, 1);
+      copy.unshift(item);
+      return copy;
+    });
+  }
+
+  async function ask(question: string) {
+    const priorMessages = active?.messages ?? [];
+    setPending(true);
+    try {
+      const result = await sendChatMessage(question, toHistory(priorMessages));
+      const { id, messages } = appendMessage({
+        question,
+        answer: result.response,
+        source: formatSources(result.sources),
+        chartBase64: result.chart ?? undefined,
+      });
+      if (accessToken) {
+        saveConversation(accessToken, id, makeTitle(messages[0].question), toHistory(messages))
+          .then(() => bumpToTop(id))
+          .catch(() => {
+            // Best-effort persistence: the message is still shown locally
+            // even if the save call failed (e.g. transient network issue).
+          });
+      }
+    } catch {
+      appendMessage({
+        question,
+        answer:
+          "Sorry — I couldn't reach the server. Make sure the API is running at " +
+          (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000") +
+          " and try again.",
+      });
+    } finally {
+      setPending(false);
+    }
   }
 
   function startNewChat() {
@@ -123,18 +228,51 @@ export default function ChatInterface() {
     setSidebarOpen(false);
   }
 
-  function selectConversation(id: string) {
+  async function selectConversation(id: string) {
     setActiveId(id);
     setSidebarOpen(false);
+    const conv = conversations.find((c) => c.id === id);
+    if (!accessToken || (conv && conv.messages.length > 0)) return;
+    try {
+      const detail = await getConversation(accessToken, id);
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === id ? { ...c, messages: fromHistory(detail.messages) } : c
+        )
+      );
+    } catch {
+      // Leave it empty on failure — the user can still start typing.
+    }
+  }
+
+  async function deleteConversationById(id: string) {
+    setConversations((prev) => prev.filter((c) => c.id !== id));
+    if (activeId === id) setActiveId(null);
+    if (!accessToken) return;
+    try {
+      await deleteConversation(accessToken, id);
+    } catch {
+      // Best-effort: already removed locally; a stale row may linger
+      // server-side until the next successful delete or eviction.
+    }
   }
 
   function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     const question = input.trim();
-    if (!question) return;
-    const known = EXAMPLE_QUESTIONS.find((ex) => ex.question === question);
-    ask(known ?? { question, answer: PLACEHOLDER_ANSWER });
+    if (!question || pending) return;
     setInput("");
+    ask(question);
+  }
+
+  if (authorized !== true) {
+    // Deliberately minimal, not a styled loading component — this state is
+    // only ever visible for the moment it takes getCurrentUser() to resolve.
+    return (
+      <div className="flex h-dvh w-full items-center justify-center">
+        <p className="text-sm text-muted-foreground">Loading…</p>
+      </div>
+    );
   }
 
   return (
@@ -144,8 +282,10 @@ export default function ChatInterface() {
         activeId={activeId}
         onSelect={selectConversation}
         onNewChat={startNewChat}
+        onDelete={deleteConversationById}
         open={sidebarOpen}
         onClose={() => setSidebarOpen(false)}
+        onSignOut={handleSignOut}
       />
 
       <div className="flex min-w-0 flex-1 flex-col">
@@ -176,16 +316,32 @@ export default function ChatInterface() {
 
         <div className="flex-1 overflow-y-auto">
           {active ? (
-            <div className="mx-auto w-full max-w-3xl divide-y divide-card-border px-6 py-8">
+            <div className="mx-auto w-full max-w-3xl px-6 py-8">
               {active.messages.map((m, i) => (
                 <ChatMessage
                   key={i}
                   question={m.question}
                   answer={m.answer}
                   source={m.source}
-                  chart={m.chart ? <RevenueChart /> : undefined}
+                  chart={
+                    m.chartBase64 ? (
+                      <div className="rounded-lg border border-card-border bg-background p-4">
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                          src={`data:image/png;base64,${m.chartBase64}`}
+                          alt="Chart"
+                          className="w-full"
+                        />
+                      </div>
+                    ) : undefined
+                  }
                 />
               ))}
+              {pending && (
+                <p className="py-8 text-sm text-muted-foreground first:pt-0">
+                  Thinking…
+                </p>
+              )}
             </div>
           ) : (
             <EmptyState onAsk={ask} />
@@ -200,15 +356,17 @@ export default function ChatInterface() {
             <input
               value={input}
               onChange={(e) => setInput(e.target.value)}
+              disabled={pending}
               placeholder="Ask about a company's filings…"
               aria-label="Ask a question"
-              className="min-w-0 flex-1 rounded-lg border border-card-border bg-card px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground/70 outline-none transition-colors focus:border-accent focus:ring-2 focus:ring-accent/30"
+              className="min-w-0 flex-1 rounded-lg border border-card-border bg-card px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground/70 outline-none transition-colors focus:border-accent focus:ring-2 focus:ring-accent/30 disabled:opacity-60"
             />
             <button
               type="submit"
-              className="shrink-0 cursor-pointer rounded-lg bg-accent px-6 py-2.5 text-sm font-semibold text-accent-foreground transition-all duration-200 hover:-translate-y-px hover:bg-accent-hover hover:shadow-md"
+              disabled={pending}
+              className="shrink-0 cursor-pointer rounded-lg bg-accent px-6 py-2.5 text-sm font-semibold text-accent-foreground transition-all duration-200 hover:-translate-y-px hover:bg-accent-hover hover:shadow-md disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:translate-y-0 disabled:hover:shadow-none"
             >
-              Send
+              {pending ? "Thinking…" : "Send"}
             </button>
           </form>
         </div>

@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
+import ConfigureAmplify from "@/components/ConfigureAmplify";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -38,6 +39,7 @@ export default function RootLayout({
         className="min-h-full flex flex-col"
         suppressHydrationWarning
       >
+        <ConfigureAmplify />
         {children}
       </body>
     </html>

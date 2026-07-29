@@ -7,15 +7,19 @@ export default function ChatSidebar({
   activeId,
   onSelect,
   onNewChat,
+  onDelete,
   open,
   onClose,
+  onSignOut,
 }: {
   conversations: { id: string; title: string }[];
   activeId: string | null;
   onSelect: (id: string) => void;
   onNewChat: () => void;
+  onDelete: (id: string) => void;
   open: boolean;
   onClose: () => void;
+  onSignOut: () => void;
 }) {
   return (
     <>
@@ -65,12 +69,12 @@ export default function ChatSidebar({
           ) : (
             <ul className="space-y-0.5">
               {conversations.map((c) => (
-                <li key={c.id}>
+                <li key={c.id} className="group flex items-center">
                   <button
                     type="button"
                     onClick={() => onSelect(c.id)}
                     aria-current={c.id === activeId}
-                    className={`w-full cursor-pointer truncate rounded-lg px-3 py-2 text-left text-sm transition-colors ${
+                    className={`min-w-0 flex-1 cursor-pointer truncate rounded-lg px-3 py-2 text-left text-sm transition-colors ${
                       c.id === activeId
                         ? "bg-accent/8 font-medium text-foreground"
                         : "text-muted-foreground hover:bg-accent-hover/8 hover:text-foreground"
@@ -78,19 +82,47 @@ export default function ChatSidebar({
                   >
                     {c.title}
                   </button>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onDelete(c.id);
+                    }}
+                    aria-label={`Delete conversation "${c.title}"`}
+                    className="shrink-0 cursor-pointer rounded-md p-1.5 text-muted-foreground opacity-0 transition-colors hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100"
+                  >
+                    <svg
+                      viewBox="0 0 20 20"
+                      className="h-4 w-4"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeWidth={1.5}
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    >
+                      <path d="M4 6h12M8 6V4.5A1.5 1.5 0 0 1 9.5 3h1A1.5 1.5 0 0 1 12 4.5V6m2 0-.6 9.4a1.5 1.5 0 0 1-1.5 1.6H8.1a1.5 1.5 0 0 1-1.5-1.6L6 6" />
+                    </svg>
+                  </button>
                 </li>
               ))}
             </ul>
           )}
         </div>
 
-        <div className="border-t border-card-border px-5 py-4">
+        <div className="flex items-center justify-between border-t border-card-border px-5 py-4">
           <Link
             href="/"
             className="text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
           >
             ← Back to home
           </Link>
+          <button
+            type="button"
+            onClick={onSignOut}
+            className="cursor-pointer text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
+          >
+            Sign out
+          </button>
         </div>
       </aside>
     </>
