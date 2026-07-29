@@ -210,6 +210,18 @@ def wants_stock_price(text_l: str) -> bool:
     return any(p in text_l for p in STOCK_PRICE_PATTERNS)
 
 
+# Broader than the generic wants_chart()/CHART_PATTERNS: a stock price
+# question is inherently about a time series, so "show me" alone is a much
+# stronger signal of wanting a chart here than it would be for, say, "show me
+# Apple's overview" — CHART_PATTERNS deliberately doesn't include "show me"
+# globally since that would trigger charts for every other feature too.
+_STOCK_CHART_PATTERNS = ["show me", "graph", "chart", "trend"]
+
+
+def _wants_stock_chart(text_l: str) -> bool:
+    return wants_chart(text_l) or any(p in text_l for p in _STOCK_CHART_PATTERNS)
+
+
 def wants_risk_section(text_l: str) -> bool:
     return any(re.search(rf"\b{re.escape(p)}", text_l) for p in RISK_SECTION_PATTERNS)
 
@@ -1827,7 +1839,7 @@ def handle_stock_price(text_l: str, companies: list[str]) -> list:
     series = _stock_price_series(company)
     if series.empty:
         return [f"I don't have stock price data for {name}." + _suggestions()]
-    if wants_chart(text_l):
+    if _wants_stock_chart(text_l):
         return [stock_price_chart_path(company, series), stock_price_summary(company, series)]
     return [stock_price_summary(company, series)]
 
@@ -3322,6 +3334,7 @@ def route_message(message: str, history: list = None):
         if carried:
             companies = [carried]
     carry_risk_section = bool(history) and _carry_forward_wants_risk_section(history)
+    carry_stock_price = bool(history) and _carry_forward_wants_stock_price(history)
 
     if wants_investment_advice(text_l):
         company = companies[0] if companies else None
@@ -3348,6 +3361,15 @@ def route_message(message: str, history: list = None):
     # _chart_series_selection matches "stock price") — silently substituting
     # a different metric for the one actually asked about.
     if wants_stock_price(text_l):
+        return handle_stock_price(text_l, companies)
+
+    # A vague chart follow-up ("make a graph of it") after a stock price
+    # question has none of STOCK_PRICE_PATTERNS' words for wants_stock_price()
+    # above to match on its own — carry the topic forward the same way
+    # company/risk-section context already carries. Gated on
+    # detect_metric_column(text_l) being None so an explicit request for a
+    # different metric ("now graph revenue growth") isn't overridden.
+    if carry_stock_price and wants_chart(text_l) and detect_metric_column(text_l) is None:
         return handle_stock_price(text_l, companies)
 
     if wants_chart(text_l):
@@ -3455,6 +3477,19 @@ def _carry_forward_wants_risk_section(history) -> bool:
     used so a follow-up like "what else?" stays scoped to that section."""
     for text in _prior_user_messages(history):
         if wants_risk_section(text.lower()):
+            return True
+    return False
+
+
+def _carry_forward_wants_stock_price(history) -> bool:
+    """True if the last 1-2 user turns were asking about stock price — used
+    so a vague chart follow-up like "make a graph of it" stays scoped to
+    stock price instead of falling into handle_chart()'s revenue-growth
+    default (that message has no stock-specific words of its own for
+    wants_stock_price() to match, the same way "what else?" has no risk-
+    specific words of its own for wants_risk_section() to match)."""
+    for text in _prior_user_messages(history):
+        if wants_stock_price(text.lower()):
             return True
     return False
 
