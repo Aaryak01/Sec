@@ -29,6 +29,30 @@ jobs:
       - name: Print resolved role ARN
         run: echo "Resolved role ARN -> arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/GitHubActionsECSDeployRole"
 
+      # Ground-truth check: decodes the REAL OIDC token GitHub issues for
+      # this run, requested with the same audience (sts.amazonaws.com) that
+      # configure-aws-credentials uses by default — rather than trusting
+      # what the docs say the sub/aud *should* be. ACTIONS_ID_TOKEN_REQUEST_
+      # URL/TOKEN are auto-injected into every step's env once the job has
+      # `permissions: id-token: write` (already set above), no extra wiring
+      # needed. Only decoded claims are printed, never the raw token itself
+      # — that token is a live bearer credential for the next few minutes,
+      # and this workflow currently runs on push (visible to anyone who can
+      # read Actions logs on this repo), so it shouldn't sit in a log.
+      # Remove this step once the mismatch is found — it's diagnostic only.
+      - name: Debug – print actual OIDC token claims
+        run: |
+          TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r '.value')
+          python3 -c "
+          import base64, json, sys
+          payload = sys.argv[1].split('.')[1]
+          payload += '=' * (-len(payload) % 4)
+          claims = json.loads(base64.urlsafe_b64decode(payload))
+          for key in ('sub', 'aud', 'iss', 'repository', 'repository_owner', 'ref', 'event_name'):
+              print(f'{key}: {claims.get(key)!r}')
+          " "$TOKEN"
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5
         with:
