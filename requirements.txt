@@ -6,6 +6,9 @@ scikit-learn
 pandas
 matplotlib
 numpy
+# Only used by fetch_stock_prices.py (run manually to refresh
+# data/stock_prices.csv) — not imported by app.py/api.py at request time.
+yfinance
 fastapi
 # [standard] pulls in uvloop/httptools for real production throughput —
 # matters once this runs on a hosting platform instead of local dev.
