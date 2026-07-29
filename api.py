@@ -53,15 +53,11 @@ import app as chatbot  # the existing Gradio app's module — routing, retrieval
 
 app = FastAPI(title="SEC Filing Analyst API")
 
-# TODO: "https://main.YOUR-APP-ID.amplifyapp.com" is a placeholder — replace
-# it with the real Amplify domain once that app is deployed (Amplify Console
-# → App → the URL shown under the branch, e.g. "main"). Until that's updated,
-# the deployed frontend's requests will be blocked by CORS even though the
-# backend itself is reachable. localhost:3000 stays in the list so local dev
-# keeps working against a deployed backend too.
+# localhost:3000 stays in the list so local dev keeps working against a
+# deployed backend too.
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
-    "https://main.YOUR-APP-ID.amplifyapp.com",
+    "https://main.d2xcvsauexn8dl.amplifyapp.com",
 ]
 app.add_middleware(
     CORSMiddleware,
