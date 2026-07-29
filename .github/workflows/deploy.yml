@@ -21,38 +21,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Diagnostic: vars.* silently resolves to "" when unset/wrong-scoped,
-      # which produces a malformed ARN (empty account segment) and fails
-      # AssumeRoleWithWebIdentity with the same generic "not authorized"
-      # error as an actual trust-policy mismatch. Printing it here isn't a
-      # secret — it's just the target ARN — so it's safe to leave in.
-      - name: Print resolved role ARN
-        run: echo "Resolved role ARN -> arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/GitHubActionsECSDeployRole"
-
-      # Ground-truth check: decodes the REAL OIDC token GitHub issues for
-      # this run, requested with the same audience (sts.amazonaws.com) that
-      # configure-aws-credentials uses by default — rather than trusting
-      # what the docs say the sub/aud *should* be. ACTIONS_ID_TOKEN_REQUEST_
-      # URL/TOKEN are auto-injected into every step's env once the job has
-      # `permissions: id-token: write` (already set above), no extra wiring
-      # needed. Only decoded claims are printed, never the raw token itself
-      # — that token is a live bearer credential for the next few minutes,
-      # and this workflow currently runs on push (visible to anyone who can
-      # read Actions logs on this repo), so it shouldn't sit in a log.
-      # Remove this step once the mismatch is found — it's diagnostic only.
-      - name: Debug – print actual OIDC token claims
-        run: |
-          TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r '.value')
-          python3 -c "
-          import base64, json, sys
-          payload = sys.argv[1].split('.')[1]
-          payload += '=' * (-len(payload) % 4)
-          claims = json.loads(base64.urlsafe_b64decode(payload))
-          for key in ('sub', 'aud', 'iss', 'repository', 'repository_owner', 'ref', 'event_name'):
-              print(f'{key}: {claims.get(key)!r}')
-          " "$TOKEN"
-
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5
         with:
@@ -70,6 +38,38 @@ jobs:
           push: true
           tags: ${{ steps.ecr-login.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
 
+      # Builds the environment-variables JSON via jq instead of interpolating
+      # secrets directly into a hand-written JSON literal. The direct-
+      # interpolation version broke with "Bad control character in string
+      # literal" — a raw, unescaped newline from one of the secrets (almost
+      # certainly a trailing newline picked up when the value was copied
+      # in) landed inside a JSON string, which JSON doesn't allow literally.
+      # jq -cn --arg properly escapes whatever's in each value (newlines,
+      # quotes, backslashes) instead of assuming it's already JSON-safe, so
+      # this class of bug can't recur regardless of what a secret contains.
+      # This does NOT fix a value that's wrong at the source, though — if a
+      # secret really does have a stray trailing newline baked in, that
+      # newline is still part of the value delivered to the container's env
+      # var (just properly escaped in transit now) and should be fixed by
+      # re-entering the secret cleanly in GitHub repo settings.
+      - name: Build container environment variables JSON
+        id: env-json
+        run: |
+          json=$(jq -cn \
+            --arg cohere "$COHERE_API_KEY" \
+            --arg akid "$DYNAMODB_AWS_ACCESS_KEY_ID" \
+            --arg sak "$DYNAMODB_AWS_SECRET_ACCESS_KEY" \
+            '[
+              {name: "COHERE_API_KEY", value: $cohere},
+              {name: "AWS_ACCESS_KEY_ID", value: $akid},
+              {name: "AWS_SECRET_ACCESS_KEY", value: $sak}
+            ]')
+          echo "json=$json" >> "$GITHUB_OUTPUT"
+        env:
+          COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+          DYNAMODB_AWS_ACCESS_KEY_ID: ${{ secrets.DYNAMODB_AWS_ACCESS_KEY_ID }}
+          DYNAMODB_AWS_SECRET_ACCESS_KEY: ${{ secrets.DYNAMODB_AWS_SECRET_ACCESS_KEY }}
+
       - name: Deploy to ECS Express Mode
         uses: aws-actions/amazon-ecs-deploy-express-service@v1
         with:
@@ -80,12 +80,4 @@ jobs:
           health-check-path: /health
           execution-role-arn: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole
           infrastructure-role-arn: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/ecsInfrastructureRoleForExpressServices
-          # These become the running container's actual env vars — the same
-          # values that would otherwise be typed into a hosting platform's
-          # console. Sourced from GitHub encrypted secrets, never committed.
-          environment-variables: |
-            [
-              {"name": "COHERE_API_KEY", "value": "${{ secrets.COHERE_API_KEY }}"},
-              {"name": "AWS_ACCESS_KEY_ID", "value": "${{ secrets.DYNAMODB_AWS_ACCESS_KEY_ID }}"},
-              {"name": "AWS_SECRET_ACCESS_KEY", "value": "${{ secrets.DYNAMODB_AWS_SECRET_ACCESS_KEY }}"}
-            ]
+          environment-variables: ${{ steps.env-json.outputs.json }}
