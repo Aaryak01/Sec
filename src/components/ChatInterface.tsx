@@ -1,18 +1,23 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { getCurrentUser, signOut, fetchAuthSession } from "aws-amplify/auth";
 import ChatMessage from "./ChatMessage";
 import ChatSidebar from "./ChatSidebar";
+import UsageIndicator from "./UsageIndicator";
+import UpgradeModal from "./UpgradeModal";
 import {
   sendChatMessage,
   listConversations,
   getConversation,
   saveConversation,
   deleteConversation,
+  getUsage,
+  confirmCheckout,
   type ChatSource,
   type HistoryTurn,
+  type UsageInfo,
 } from "@/lib/chat-api";
 
 type Message = {
@@ -101,6 +106,7 @@ function EmptyState({ onAsk }: { onAsk: (question: string) => void }) {
 
 export default function ChatInterface() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [input, setInput] = useState("");
@@ -110,6 +116,13 @@ export default function ChatInterface() {
   // redirect for a genuinely signed-out visitor.
   const [authorized, setAuthorized] = useState<boolean | null>(null);
   const [accessToken, setAccessToken] = useState<string | null>(null);
+  const [usage, setUsage] = useState<UsageInfo | null>(null);
+  // Distinct from `usage.messages_used >= limit` — set only from an actual
+  // limit_reached response, so the banner appears the moment the block
+  // happens rather than only after a page refresh re-fetches /usage.
+  const [limitReached, setLimitReached] = useState(false);
+  const [showUpgradeModal, setShowUpgradeModal] = useState(false);
+  const [upgradeConfirmedMessage, setUpgradeConfirmedMessage] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -125,13 +138,49 @@ export default function ChatInterface() {
           const token = session.tokens?.accessToken?.toString();
           if (!token || cancelled) return;
           setAccessToken(token);
-          const list = await listConversations(token);
+
+          const [list, usageInfo] = await Promise.all([
+            listConversations(token),
+            getUsage(token),
+          ]);
           if (cancelled) return;
           setConversations(
             list.map((c) => ({ id: c.id, title: c.title, messages: [] }))
           );
+          setUsage(usageInfo);
+          if (usageInfo.tier === "free" && usageInfo.messages_limit !== null) {
+            setLimitReached(usageInfo.messages_used >= usageInfo.messages_limit);
+          }
+
+          // Returning from Stripe Checkout: success_url carries these two
+          // params. Confirming here (rather than trusting the redirect
+          // alone) is what actually applies the upgrade — see api.py's
+          // /billing/confirm comment for why this checks the session
+          // directly instead of waiting on a webhook.
+          const upgradeStatus = searchParams.get("upgrade");
+          const sessionId = searchParams.get("session_id");
+          if (upgradeStatus === "success" && sessionId) {
+            try {
+              const updatedUsage = await confirmCheckout(token, sessionId);
+              if (cancelled) return;
+              setUsage(updatedUsage);
+              setLimitReached(false);
+              setUpgradeConfirmedMessage(
+                "You're on Pro now — unlimited messages, no daily limit."
+              );
+            } catch {
+              // Checkout may have already been confirmed by a prior load
+              // (e.g. the user refreshed) or genuinely failed — either way,
+              // silently re-fetching current usage below is the safe
+              // fallback rather than showing a scary error for a likely
+              // no-op.
+            }
+          }
+          if (upgradeStatus) {
+            router.replace("/chat");
+          }
         } catch {
-          // sidebar stays empty
+          // sidebar/usage stay empty
         }
       })
       .catch(() => {
@@ -140,6 +189,7 @@ export default function ChatInterface() {
     return () => {
       cancelled = true;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [router]);
 
   async function handleSignOut() {
@@ -191,24 +241,33 @@ export default function ChatInterface() {
   }
 
   async function ask(question: string) {
+    if (!accessToken || limitReached) return;
     const priorMessages = active?.messages ?? [];
     setPending(true);
     try {
-      const result = await sendChatMessage(question, toHistory(priorMessages));
+      const result = await sendChatMessage(accessToken, question, toHistory(priorMessages));
+      setUsage(result.usage);
+
+      if (result.limit_reached) {
+        // No real answer was produced — don't spend a chat turn on it, and
+        // don't fall through to saveConversation below. The banner (driven
+        // by `limitReached`) is what communicates this, not a chat bubble.
+        setLimitReached(true);
+        return;
+      }
+
       const { id, messages } = appendMessage({
         question,
         answer: result.response,
         source: formatSources(result.sources),
         chartBase64: result.chart ?? undefined,
       });
-      if (accessToken) {
-        saveConversation(accessToken, id, makeTitle(messages[0].question), toHistory(messages))
-          .then(() => bumpToTop(id))
-          .catch(() => {
-            // Best-effort persistence: the message is still shown locally
-            // even if the save call failed (e.g. transient network issue).
-          });
-      }
+      saveConversation(accessToken, id, makeTitle(messages[0].question), toHistory(messages))
+        .then(() => bumpToTop(id))
+        .catch(() => {
+          // Best-effort persistence: the message is still shown locally
+          // even if the save call failed (e.g. transient network issue).
+        });
     } catch {
       appendMessage({
         question,
@@ -349,28 +408,74 @@ export default function ChatInterface() {
         </div>
 
         <div className="border-t border-card-border px-6 py-4">
-          <form
-            onSubmit={handleSubmit}
-            className="mx-auto flex w-full max-w-3xl gap-3"
-          >
-            <input
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              disabled={pending}
-              placeholder="Ask about a company's filings…"
-              aria-label="Ask a question"
-              className="min-w-0 flex-1 rounded-lg border border-card-border bg-card px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground/70 outline-none transition-colors focus:border-accent focus:ring-2 focus:ring-accent/30 disabled:opacity-60"
-            />
-            <button
-              type="submit"
-              disabled={pending}
-              className="shrink-0 cursor-pointer rounded-lg bg-accent px-6 py-2.5 text-sm font-semibold text-accent-foreground transition-all duration-200 hover:-translate-y-px hover:bg-accent-hover hover:shadow-md disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:translate-y-0 disabled:hover:shadow-none"
-            >
-              {pending ? "Thinking…" : "Send"}
-            </button>
-          </form>
+          {upgradeConfirmedMessage && (
+            <div className="mx-auto mb-3 w-full max-w-3xl rounded-lg border border-accent/30 bg-accent/8 px-4 py-2.5 text-sm text-foreground">
+              {upgradeConfirmedMessage}
+            </div>
+          )}
+
+          {limitReached ? (
+            // Replaces the input entirely rather than just disabling it —
+            // this is meant to read as "here's what to do next," not as a
+            // grayed-out dead end.
+            <div className="mx-auto w-full max-w-3xl rounded-lg border border-card-border bg-card px-5 py-4 text-center">
+              <p className="mb-3 text-sm text-foreground">
+                You&apos;ve reached today&apos;s free limit of{" "}
+                {usage?.messages_limit ?? 10} messages.
+                {usage?.resets_at && (
+                  <>
+                    {" "}
+                    Your limit resets at{" "}
+                    {new Date(usage.resets_at).toLocaleTimeString(undefined, {
+                      hour: "numeric",
+                      minute: "2-digit",
+                      timeZoneName: "short",
+                    })}
+                    .
+                  </>
+                )}
+              </p>
+              <button
+                type="button"
+                onClick={() => setShowUpgradeModal(true)}
+                className="cursor-pointer rounded-lg bg-accent px-6 py-2.5 text-sm font-semibold text-accent-foreground transition-all duration-200 hover:-translate-y-px hover:bg-accent-hover hover:shadow-md"
+              >
+                Upgrade to Pro for unlimited messages
+              </button>
+            </div>
+          ) : (
+            <>
+              <UsageIndicator usage={usage} onUpgradeClick={() => setShowUpgradeModal(true)} />
+              <form
+                onSubmit={handleSubmit}
+                className="mx-auto flex w-full max-w-3xl gap-3"
+              >
+                <input
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  disabled={pending}
+                  placeholder="Ask about a company's filings…"
+                  aria-label="Ask a question"
+                  className="min-w-0 flex-1 rounded-lg border border-card-border bg-card px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground/70 outline-none transition-colors focus:border-accent focus:ring-2 focus:ring-accent/30 disabled:opacity-60"
+                />
+                <button
+                  type="submit"
+                  disabled={pending}
+                  className="shrink-0 cursor-pointer rounded-lg bg-accent px-6 py-2.5 text-sm font-semibold text-accent-foreground transition-all duration-200 hover:-translate-y-px hover:bg-accent-hover hover:shadow-md disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:translate-y-0 disabled:hover:shadow-none"
+                >
+                  {pending ? "Thinking…" : "Send"}
+                </button>
+              </form>
+            </>
+          )}
         </div>
       </div>
+
+      <UpgradeModal
+        open={showUpgradeModal}
+        onClose={() => setShowUpgradeModal(false)}
+        accessToken={accessToken}
+      />
     </div>
   );
 }
