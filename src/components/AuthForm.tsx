@@ -1,14 +1,16 @@
 "use client";
 
-import { useId, useState } from "react";
+import { useEffect, useId, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   confirmSignUp,
+  getCurrentUser,
   resendSignUpCode,
-  signIn,
+  signOut,
   signUp,
 } from "aws-amplify/auth";
 import { describeAuthError } from "@/lib/auth-errors";
+import { signInWithRecovery, StaleSessionRecoveryError } from "@/lib/auth-recovery";
 
 type Mode = "signin" | "signup";
 type Step = "form" | "verify";
@@ -31,15 +33,58 @@ export default function AuthForm() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [resendMessage, setResendMessage] = useState<string | null>(null);
+  // Set only when automatic stale-session recovery itself failed (see
+  // auth-recovery.ts) — shows a manual fallback instead of the generic
+  // error text, since a normal user otherwise has no way to act on
+  // "there's already a signed in user" themselves.
+  const [staleSessionStuck, setStaleSessionStuck] = useState(false);
+  // null = still checking, so this landing page's auth form never flashes
+  // before a redirect for a visitor who's already signed in — this is the
+  // actual root cause of most "already signed in" errors: a returning,
+  // still-authenticated user landing on "/" and seeing (and submitting) a
+  // sign-in form the app never needed to show them at all. Mirrors
+  // ChatInterface's own auth check, just redirecting the opposite way.
+  const [checkingExistingSession, setCheckingExistingSession] = useState(true);
   const emailId = useId();
   const passwordId = useId();
   const codeId = useId();
+
+  useEffect(() => {
+    let cancelled = false;
+    getCurrentUser()
+      .then(() => {
+        if (!cancelled) router.replace("/chat");
+      })
+      .catch(() => {
+        if (!cancelled) setCheckingExistingSession(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [router]);
+
+  async function handleStaleSessionSignOut() {
+    setError(null);
+    setStaleSessionStuck(false);
+    setLoading(true);
+    try {
+      await signOut();
+    } catch {
+      // Best-effort — even if the network call to revoke tokens failed,
+      // Amplify's local sign-out step still runs first and clears the
+      // cached session that was actually blocking sign-in, so retrying
+      // below is still worth doing.
+    } finally {
+      setLoading(false);
+    }
+  }
 
   const isSignup = mode === "signup";
 
   async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     setError(null);
+    setStaleSessionStuck(false);
     setLoading(true);
     try {
       if (isSignup) {
@@ -54,11 +99,14 @@ export default function AuthForm() {
           setStep("verify");
         } else {
           // Pool has no confirmation step configured — sign straight in.
-          await signIn({ username: email, password });
+          // Goes through signInWithRecovery too: a brand-new account can't
+          // itself be the stale session, but the *browser* could still
+          // have an unrelated leftover one cached from earlier.
+          await signInWithRecovery(email, password);
           router.push("/chat");
         }
       } else {
-        const result = await signIn({ username: email, password });
+        const result = await signInWithRecovery(email, password);
         if (result.isSignedIn) {
           router.push("/chat");
         } else if (result.nextStep.signInStep === "CONFIRM_SIGN_UP") {
@@ -78,7 +126,11 @@ export default function AuthForm() {
         }
       }
     } catch (err) {
-      setError(describeAuthError(err));
+      if (err instanceof StaleSessionRecoveryError) {
+        setStaleSessionStuck(true);
+      } else {
+        setError(describeAuthError(err));
+      }
     } finally {
       setLoading(false);
     }
@@ -87,6 +139,7 @@ export default function AuthForm() {
   async function handleVerify(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     setError(null);
+    setStaleSessionStuck(false);
     setLoading(true);
     try {
       await confirmSignUp({
@@ -95,7 +148,7 @@ export default function AuthForm() {
       });
       // The password is still in state from the form step, so we can sign
       // the user straight in rather than sending them back to re-enter it.
-      const result = await signIn({ username: email, password });
+      const result = await signInWithRecovery(email, password);
       if (result.isSignedIn) {
         router.push("/chat");
       } else {
@@ -104,7 +157,11 @@ export default function AuthForm() {
         setMode("signin");
       }
     } catch (err) {
-      setError(describeAuthError(err));
+      if (err instanceof StaleSessionRecoveryError) {
+        setStaleSessionStuck(true);
+      } else {
+        setError(describeAuthError(err));
+      }
     } finally {
       setLoading(false);
     }
@@ -119,6 +176,21 @@ export default function AuthForm() {
     } catch (err) {
       setError(describeAuthError(err));
     }
+  }
+
+  if (checkingExistingSession) {
+    // Same footprint as the real card below so nothing jumps once this
+    // resolves — for a genuinely anonymous visitor (the common case) this
+    // never renders long enough to notice, since getCurrentUser() fails
+    // near-instantly with no cached tokens to check at all.
+    return (
+      <div
+        id="auth"
+        className="w-full max-w-sm rounded-[20px] border border-card-border bg-card p-6 shadow-[0_2px_8px_rgba(33,33,69,0.06),0_12px_32px_rgba(33,33,69,0.08)] sm:p-8"
+      >
+        <p className="text-sm text-muted-foreground">Loading…</p>
+      </div>
+    );
   }
 
   if (step === "verify") {
@@ -155,6 +227,21 @@ export default function AuthForm() {
             />
           </div>
 
+          {staleSessionStuck && (
+            <div className="rounded-lg border border-card-border bg-background p-3">
+              <p className="mb-2 text-sm text-foreground">
+                You&apos;re already signed in on this browser, and we
+                couldn&apos;t clear that session automatically.
+              </p>
+              <button
+                type="button"
+                onClick={handleStaleSessionSignOut}
+                className="cursor-pointer text-sm font-medium text-accent hover:underline"
+              >
+                Sign out and continue
+              </button>
+            </div>
+          )}
           {error && <p className="text-sm text-red-600">{error}</p>}
           {resendMessage && !error && (
             <p className="text-sm text-muted-foreground">{resendMessage}</p>
@@ -276,6 +363,21 @@ export default function AuthForm() {
           )}
         </div>
 
+        {staleSessionStuck && (
+          <div className="rounded-lg border border-card-border bg-background p-3">
+            <p className="mb-2 text-sm text-foreground">
+              You&apos;re already signed in on this browser, and we
+              couldn&apos;t clear that session automatically.
+            </p>
+            <button
+              type="button"
+              onClick={handleStaleSessionSignOut}
+              className="cursor-pointer text-sm font-medium text-accent hover:underline"
+            >
+              Sign out and continue
+            </button>
+          </div>
+        )}
         {error && <p className="text-sm text-red-600">{error}</p>}
 
         <button
