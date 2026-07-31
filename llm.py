@@ -190,3 +190,99 @@ def answer(
     if not text:
         logger.warning("answer: response had finish_reason=%r but no text content", response.finish_reason)
     return text or None
+
+
+# ---------------------------------------------------------------------------
+# Stock-price-vs-fundamentals comparison.
+#
+# A separate function (not a call to answer() above) because this compares
+# two numeric data series — a stock price trend and a financial metric
+# trend — not filing text passages. answer()'s SYSTEM_PROMPT and
+# build_documents() are both written specifically around filing chunks
+# (form/date/section citations, "ground every claim in the supplied
+# documents" meaning filing documents); reusing them here would produce a
+# nonsensical citation ("Source: Tesla, Form None, filed None") and a prompt
+# that doesn't actually describe the task. Same grounding principle either
+# way, though: the two summaries are pre-computed from real data
+# (stock_prices.csv, company_metrics.csv) and handed to the model as
+# `documents`, exactly so it reasons over our real numbers instead of
+# reaching for its own (likely stale or wrong) knowledge of the company's
+# actual stock price.
+# ---------------------------------------------------------------------------
+
+COMPARE_SYSTEM_PROMPT = """You are the SEC Filing Analyst, comparing a company's stock price to one of \
+its real financial metrics (drawn from its SEC filings).
+
+You will be given two documents: one describing the company's recent stock price and how it's changed \
+over the past year, and one describing a specific financial metric's trend across recent fiscal years. \
+Answer using ONLY the numbers in those two documents — never invent, estimate, or recall from your own \
+knowledge a figure that isn't there.
+
+- Directly compare the two: has the stock price moved in the same direction as the metric, the opposite \
+direction, or has one moved much more than the other? Say so explicitly, citing the actual numbers from \
+both documents.
+- Explain what it can mean when a stock price moves independently of the underlying metric: the market \
+may have already priced in a change, may be reacting to something else entirely (competition, margins, \
+macro conditions, broader sentiment), or may be pricing in future performance that hasn't shown up in \
+the metric yet.
+- If the two data points are moving together, say that plainly too rather than manufacturing a tension \
+that isn't there.
+- Never recommend buying, selling, or holding the stock, and never predict where the price is headed — \
+describe the relationship between the two data points you were given, not what happens next.
+- Keep it to a few short paragraphs. No preamble about what you're about to do."""
+
+
+def cross_metric_answer(
+    question: str,
+    company: str,
+    stock_summary: str,
+    metric_label: str,
+    metric_summary: str,
+    history: list = None,
+) -> str:
+    """Returns the model's comparison of `stock_summary` against
+    `metric_summary` for `company`, or None to fall back to a template.
+
+    Unlike answer(), the two "documents" here are one-line, pre-computed
+    factual summaries app.py already built from stock_prices.csv and
+    company_metrics.csv — not raw passages — since this reasons over two
+    numeric trends, not filing text."""
+    if _client is None:
+        logger.warning("cross_metric_answer: no Cohere client configured (COHERE_API_KEY unset) — returning None")
+        return None
+
+    documents = [
+        cohere.Document(
+            id="1",
+            data={"company": company, "data_type": "stock price", "summary": stock_summary},
+        ),
+        cohere.Document(
+            id="2",
+            data={"company": company, "data_type": metric_label, "summary": metric_summary},
+        ),
+    ]
+    messages = [{"role": "system", "content": COMPARE_SYSTEM_PROMPT}]
+    messages.extend(_prior_turns(history or []))
+    messages.append({"role": "user", "content": question})
+
+    try:
+        response = _client.chat(
+            model=MODEL,
+            messages=messages,
+            documents=documents,
+            max_tokens=MAX_TOKENS,
+            temperature=TEMPERATURE,
+        )
+    except (ApiError, httpx.HTTPError) as e:
+        logger.error("cross_metric_answer: Cohere call failed (%s): %s", type(e).__name__, e)
+        return None
+
+    if response.finish_reason not in ("COMPLETE", "MAX_TOKENS", "STOP_SEQUENCE"):
+        logger.warning("cross_metric_answer: unusable finish_reason=%r — returning None", response.finish_reason)
+        return None
+
+    text = "\n\n".join(
+        item.text for item in (response.message.content or [])
+        if getattr(item, "type", "text") == "text" and getattr(item, "text", None)
+    ).strip()
+    return text or None

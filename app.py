@@ -259,6 +259,31 @@ def _resolve_stock_comparison_companies(text_l: str, companies: list[str], histo
     return None
 
 
+# A stock price question that ALSO references a different, filing-reported
+# metric ("...compared to its revenue growth", "vs its fundamentals",
+# "against its margins") needs real reasoning across two independent data
+# sources (stock_prices.csv and company_metrics.csv) that no deterministic
+# handler here can do — that's routed to Cohere (see
+# handle_stock_vs_metric_comparison / llm.cross_metric_answer) instead of
+# the plain single-stock handler, which would otherwise just report the
+# stock price alone and silently drop the "compared to X" half of the
+# question. Gated on wants_stock_price() rather than checked standalone so
+# this can only ever fire on a message that's already a stock question.
+_CROSS_METRIC_COMPARE_RE = re.compile(r"compar\w*|\bvs\.?\b|\bversus\b|\bagainst\b|relative to")
+
+_FUNDAMENTALS_WORDS = [
+    "fundamentals", "financials", "financial performance",
+    "revenue", "margin", "earnings", "cash flow", "r&d",
+    "research and development",
+]
+
+
+def wants_stock_vs_metric_comparison(text_l: str) -> bool:
+    if not (wants_stock_price(text_l) and _CROSS_METRIC_COMPARE_RE.search(text_l)):
+        return False
+    return any(w in text_l for w in _FUNDAMENTALS_WORDS)
+
+
 def wants_risk_section(text_l: str) -> bool:
     return any(re.search(rf"\b{re.escape(p)}", text_l) for p in RISK_SECTION_PATTERNS)
 
@@ -1971,6 +1996,68 @@ def handle_stock_price(text_l: str, companies: list[str], history=None) -> list:
     return [stock_price_summary(company, series)]
 
 
+def _stock_context_summary(company: str, series: pd.DataFrame) -> str:
+    """Leaner than stock_price_summary() — just the facts (no teaching-note
+    sentence), since that note is about to be superseded by whatever
+    llm.cross_metric_answer() actually says about this specific comparison,
+    or duplicated in the template fallback below instead."""
+    name = COMPANY_DISPLAY.get(company, company.capitalize())
+    latest_date, latest_close, prior_close, pct_change = _stock_price_stats(series)
+    sentence = f"{name}'s stock closed at ${latest_close:,.2f} on {latest_date.date()}"
+    if pct_change is not None:
+        direction = "up" if pct_change >= 0 else "down"
+        sentence += f", {direction} {abs(pct_change):.1f}% from a year ago (${prior_close:,.2f})"
+    sentence += "."
+    return sentence
+
+
+def handle_stock_vs_metric_comparison(
+    message: str, text_l: str, companies: list[str], history: list = None
+) -> list:
+    if not companies:
+        return [
+            "Which company would you like to compare stock price and fundamentals for? "
+            "Try naming one, e.g. \"Compare Tesla's stock price to its revenue growth.\""
+        ]
+    company = companies[0]
+    name = COMPANY_DISPLAY.get(company, company.capitalize())
+
+    series = _stock_price_series(company)
+    if series.empty:
+        return [f"I don't have stock price data for {name}." + _suggestions()]
+
+    # "vs its fundamentals"/"financials" names no specific metric — default
+    # to revenue growth, the same fallback handle_future_prediction already
+    # uses when a message implies "how's the company doing" without naming
+    # one.
+    metric_col = detect_metric_column(text_l) or "Revenue Growth %"
+    metric_label = METRIC_LABEL[metric_col]
+
+    stock_summary = _stock_context_summary(company, series)
+    metric_summary = _metric_trend_sentence(company, metric_col)
+    if metric_summary is None:
+        return [f"I don't have {metric_label} data for {name}." + _suggestions(company)]
+
+    if llm.is_enabled():
+        generated = llm.cross_metric_answer(
+            message, name, stock_summary, metric_label, metric_summary, history
+        )
+        if generated:
+            return [generated]
+
+    # Template fallback if Cohere is unavailable or the call failed — still
+    # a genuine two-metric comparison, just without free-form reasoning
+    # about *why* they diverge. metric_summary is already a complete,
+    # properly-capitalized sentence (it starts with the company's display
+    # name and _metric_trend_sentence() appends its own literacy note for
+    # that metric) — so it's placed here as its own sentence rather than
+    # spliced mid-sentence, which previously mis-lowercased the leading
+    # proper noun.
+    note = INVESTING_LITERACY["stock_vs_fundamentals"]
+    sentence = f"{stock_summary} {metric_summary} {note['signal']} {note['follow_up']}"
+    return [sentence]
+
+
 def _lower_title(title: str) -> str:
     return title.lower().replace("r&d", "R&D")
 
@@ -3481,6 +3568,16 @@ def route_message(message: str, history: list = None):
         chart_path = risk_tone_chart_path(company, scores)
         summary = risk_tone_summary(company, scores)
         return [chart_path, summary]
+
+    # Must come before wants_stock_price(): "show me X's stock price growth
+    # compared to its revenue growth" IS a stock price question by that
+    # check's own definition (it contains "stock price"), so without this
+    # ahead of it, handle_stock_price() would intercept it and answer with
+    # just the stock price alone — silently dropping the "compared to
+    # revenue growth" half of the question, which needs real reasoning
+    # across two data sources no deterministic handler here can do.
+    if wants_stock_vs_metric_comparison(text_l):
+        return handle_stock_vs_metric_comparison(message, text_l, companies, history)
 
     # Must come before wants_chart(): "show me X's stock price trend"
     # contains "trend", which would otherwise trip wants_chart() and land in
