@@ -1939,6 +1939,47 @@ def stock_price_comparison_chart_path(
     return path
 
 
+def stock_vs_metric_chart_path(company: str, series: pd.DataFrame, metric_col: str):
+    """Stock price (daily line, left axis) and a filing-reported metric
+    (yearly bars, right axis) on one figure — the chart counterpart of
+    handle_stock_vs_metric_comparison()'s two-source text answer. Twin axes
+    rather than two subplots since the two series share the same time span
+    and this keeps them visually aligned instead of stacked separately."""
+    name = COMPANY_DISPLAY.get(company, company.capitalize())
+    raw_col = RAW_COLUMN_OF[metric_col]
+    metric_label = METRIC_LABEL[metric_col]
+
+    fig, ax_price = plt.subplots(figsize=(7.5, 4.5), facecolor=CHART_BACKGROUND)
+    ax_price.set_facecolor(CHART_BACKGROUND)
+    ax_price.plot(series["date"], series["close_price"], color=CHART_PRIMARY, linewidth=1.5, label="Stock price")
+    ax_price.set_xlabel("Date", color=CHART_TEXT)
+    ax_price.set_ylabel("Close Price ($)", color=CHART_PRIMARY)
+    _style_axes(ax_price)
+
+    ax_metric = ax_price.twinx()
+    ax_metric.set_facecolor(CHART_BACKGROUND)
+    years = [pd.Timestamp(y, 7, 1) for y in VALID_YEARS]
+    vals = [_raw_value(company, y, raw_col) for y in VALID_YEARS]
+    bar_years = [y for y, v in zip(years, vals) if v is not None]
+    bar_vals = [v for v in vals if v is not None]
+    ax_metric.bar(bar_years, bar_vals, width=120, color=CHART_HOVER, alpha=0.55, label=metric_label.capitalize())
+    ax_metric.set_ylabel(f"{metric_label.capitalize()} ({_chart_unit(raw_col)})", color=CHART_HOVER)
+    ax_metric.tick_params(axis="y", colors=CHART_HOVER)
+    ax_metric.spines["right"].set_color(CHART_GRID)
+
+    ax_price.set_title(f"Stock Price vs {metric_label.capitalize()} — {name}", color=CHART_PRIMARY)
+    lines, labels = ax_price.get_legend_handles_labels()
+    bars, bar_labels = ax_metric.get_legend_handles_labels()
+    ax_price.legend(lines + bars, labels + bar_labels, facecolor=CHART_BACKGROUND, edgecolor=CHART_GRID, labelcolor=CHART_TEXT)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+
+    path = CHART_DIR / f"stock_vs_metric_{company}_{uuid.uuid4().hex[:8]}.png"
+    fig.savefig(path, facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return path
+
+
 def stock_price_comparison_summary(
     company_a: str, series_a: pd.DataFrame, company_b: str, series_b: pd.DataFrame
 ) -> str:
@@ -2012,7 +2053,7 @@ def _stock_context_summary(company: str, series: pd.DataFrame) -> str:
 
 
 def handle_stock_vs_metric_comparison(
-    message: str, text_l: str, companies: list[str], history: list = None
+    message: str, text_l: str, companies: list[str], history: list = None, force_chart: bool = False
 ) -> list:
     if not companies:
         return [
@@ -2026,11 +2067,17 @@ def handle_stock_vs_metric_comparison(
     if series.empty:
         return [f"I don't have stock price data for {name}." + _suggestions()]
 
-    # "vs its fundamentals"/"financials" names no specific metric — default
-    # to revenue growth, the same fallback handle_future_prediction already
-    # uses when a message implies "how's the company doing" without naming
-    # one.
-    metric_col = detect_metric_column(text_l) or "Revenue Growth %"
+    # "vs its fundamentals"/"financials" names no specific metric — first
+    # check whether a prior turn in this same comparison already pinned one
+    # down (a chart follow-up like "show a graph of this" names no metric of
+    # its own), then fall back to revenue growth, the same default
+    # handle_future_prediction uses when a message implies "how's the
+    # company doing" without naming one.
+    metric_col = (
+        detect_metric_column(text_l)
+        or _carry_forward_cross_metric_col(history)
+        or "Revenue Growth %"
+    )
     metric_label = METRIC_LABEL[metric_col]
 
     stock_summary = _stock_context_summary(company, series)
@@ -2038,12 +2085,32 @@ def handle_stock_vs_metric_comparison(
     if metric_summary is None:
         return [f"I don't have {metric_label} data for {name}." + _suggestions(company)]
 
+    parts = []
+    chart_included = force_chart or _wants_stock_chart(text_l)
+    if chart_included:
+        parts.append(stock_vs_metric_chart_path(company, series, metric_col))
+
+    # When a chart is included, the model otherwise answers the literal
+    # "show a graph of this" wording and disclaims that it can't produce
+    # images — even though one is already rendered and about to be shown
+    # right alongside its answer. Telling it so avoids that (harmless but
+    # confusing) mismatch between the chart the user sees and the text
+    # under it.
+    llm_question = message
+    if chart_included:
+        llm_question += (
+            "\n\n(A chart plotting both series has already been generated and will "
+            "be shown alongside your answer — don't say you can't produce a graph; "
+            "just analyze the comparison.)"
+        )
+
     if llm.is_enabled():
         generated = llm.cross_metric_answer(
-            message, name, stock_summary, metric_label, metric_summary, history
+            llm_question, name, stock_summary, metric_label, metric_summary, history
         )
         if generated:
-            return [generated]
+            parts.append(generated)
+            return parts
 
     # Template fallback if Cohere is unavailable or the call failed — still
     # a genuine two-metric comparison, just without free-form reasoning
@@ -2055,7 +2122,8 @@ def handle_stock_vs_metric_comparison(
     # proper noun.
     note = INVESTING_LITERACY["stock_vs_fundamentals"]
     sentence = f"{stock_summary} {metric_summary} {note['signal']} {note['follow_up']}"
-    return [sentence]
+    parts.append(sentence)
+    return parts
 
 
 def _lower_title(title: str) -> str:
@@ -3549,6 +3617,7 @@ def route_message(message: str, history: list = None):
             companies = [carried]
     carry_risk_section = bool(history) and _carry_forward_wants_risk_section(history)
     carry_stock_price = bool(history) and _carry_forward_wants_stock_price(history)
+    carry_cross_metric_col = _carry_forward_cross_metric_col(history) if history else None
 
     if wants_investment_advice(text_l):
         company = companies[0] if companies else None
@@ -3586,6 +3655,23 @@ def route_message(message: str, history: list = None):
     # a different metric for the one actually asked about.
     if wants_stock_price(text_l):
         return handle_stock_price(text_l, companies, history)
+
+    # A chart follow-up ("show a graph of this") after a CROSS-METRIC
+    # comparison ("compare Tesla's stock price growth with its revenue
+    # growth") needs to plot both series together, not revert to the plain
+    # single-metric stock chart below. Must come before the carry_stock_price
+    # branch: a cross-metric turn's text also satisfies wants_stock_price()
+    # (wants_stock_vs_metric_comparison is gated on it), so carry_stock_price
+    # would be True here too and, if checked first, would win and silently
+    # drop the fundamentals half of the chart the same way the text answer
+    # used to. Gated on detect_metric_column(text_l) being None so an
+    # explicit request for a different metric isn't overridden.
+    if (
+        carry_cross_metric_col
+        and detect_metric_column(text_l) is None
+        and wants_chart(text_l)
+    ):
+        return handle_stock_vs_metric_comparison(message, text_l, companies, history, force_chart=True)
 
     # A vague follow-up after a stock price question has none of
     # STOCK_PRICE_PATTERNS' words for wants_stock_price() above to match on
@@ -3734,6 +3820,24 @@ def _carry_forward_wants_stock_price(history) -> bool:
         if wants_stock_price(text.lower()):
             return True
     return False
+
+
+def _carry_forward_cross_metric_col(history):
+    """The metric column from the last 1-2 turns' stock-vs-fundamentals
+    comparison, or None if neither turn was one. Distinct from (and checked
+    before) _carry_forward_wants_stock_price: that check alone can't tell a
+    follow-up after a plain stock-price question apart from one after a
+    CROSS-METRIC comparison, since a cross-metric turn's text also satisfies
+    wants_stock_price() (it's a superset check) — so "show a graph of this"
+    after "compare Tesla's stock price to its revenue growth" would
+    otherwise fall into handle_stock_price()'s single-series chart and
+    silently drop the revenue-growth half, the same bug this whole feature
+    exists to fix for the text answer."""
+    for text in _prior_user_messages(history):
+        text_l = text.lower()
+        if wants_stock_vs_metric_comparison(text_l):
+            return detect_metric_column(text_l) or "Revenue Growth %"
+    return None
 
 
 def user_submit(message, history):
