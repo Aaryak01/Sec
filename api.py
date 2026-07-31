@@ -33,12 +33,13 @@ import base64
 import json
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, Optional
 
 import boto3
 import jwt
+import stripe
 from boto3.dynamodb.conditions import Key
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -65,6 +66,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# The same real Amplify domain as ALLOWED_ORIGINS[-1] above, reused as the
+# base for Stripe Checkout's success/cancel redirect URLs. Overridable via
+# env var for local dev against a deployed Stripe config.
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "https://main.d2xcvsauexn8dl.amplifyapp.com")
+
+
+# ---------------------------------------------------------------------------
+# Stripe (TEST MODE ONLY).
+#
+# This whole app is a portfolio demo — STRIPE_SECRET_KEY here is always a
+# sk_test_... key, never a live key, and STRIPE_PRICE_ID points at a Product/
+# Price created in the Stripe Dashboard's test mode. Checkout uses Stripe's
+# published test card 4242 4242 4242 4242 (any future expiry, any CVC) — no
+# real payment ever occurs. See the /billing endpoints below.
+# ---------------------------------------------------------------------------
+
+stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_PRICE_ID = os.environ.get("STRIPE_PRICE_ID", "")
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +147,107 @@ def get_current_user_id(authorization: str = Header(None)) -> str:
     return claims["sub"]
 
 
+# ---------------------------------------------------------------------------
+# Usage tracking / tier enforcement (DynamoDB).
+#
+# Table "sec-chatbot-usage": partition key user_id (Cognito sub). Attributes:
+# tier ("free" | "pro"), message_count (int), count_date (the UTC calendar
+# date, "YYYY-MM-DD", the count applies to).
+#
+# Reset policy: midnight UTC, not a rolling 24h window — chosen because it's
+# simpler to reason about and show a user ("resets at midnight UTC") than a
+# rolling window tied to their first message of the day. The reset itself
+# isn't a scheduled job: get_usage() just treats a stored count_date that
+# isn't today as an implicit zero, and the next write naturally stamps
+# today's date. No cleanup process is needed.
+# ---------------------------------------------------------------------------
+
+USAGE_TABLE_NAME = "sec-chatbot-usage"
+FREE_DAILY_MESSAGE_LIMIT = 10
+
+# Shared boto3 resource — also used by the conversations table further down.
+# Credentials/region come from the default boto3 chain (env vars on the
+# hosting platform, or the AWS CLI credentials already configured locally).
+_dynamodb = boto3.resource("dynamodb", region_name=COGNITO_REGION)
+_usage_table = _dynamodb.Table(USAGE_TABLE_NAME)
+
+
+def _today_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def _resets_at_utc() -> str:
+    now = datetime.now(timezone.utc)
+    midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight.isoformat()
+
+
+def get_usage(user_id: str) -> dict:
+    """Always returns {tier, message_count, count_date} — message_count is 0
+    whenever the stored count_date isn't today, whether that's because the
+    user has never sent a message or because their last message was on an
+    earlier UTC date (i.e. this is where "reset at midnight" actually
+    happens — implicitly, on next read, not via a scheduled job)."""
+    item = _usage_table.get_item(Key={"user_id": user_id}).get("Item")
+    today = _today_utc()
+    if item is None:
+        return {"tier": "free", "message_count": 0, "count_date": today}
+    tier = item.get("tier", "free")
+    if item.get("count_date") != today:
+        return {"tier": tier, "message_count": 0, "count_date": today}
+    return {"tier": tier, "message_count": int(item["message_count"]), "count_date": today}
+
+
+def increment_usage(user_id: str) -> dict:
+    """Increments today's count (starting fresh at 1 if the stored count was
+    for an earlier date) and returns the updated usage dict."""
+    usage = get_usage(user_id)
+    usage["message_count"] += 1
+    _usage_table.put_item(
+        Item={
+            "user_id": user_id,
+            "tier": usage["tier"],
+            "message_count": usage["message_count"],
+            "count_date": usage["count_date"],
+        }
+    )
+    return usage
+
+
+def set_user_tier(user_id: str, tier: str) -> None:
+    """Used by the billing confirmation endpoint to upgrade a user to pro —
+    preserves whatever usage count already exists rather than resetting it,
+    since pro users bypass the limit check entirely regardless of count."""
+    usage = get_usage(user_id)
+    _usage_table.put_item(
+        Item={
+            "user_id": user_id,
+            "tier": tier,
+            "message_count": usage["message_count"],
+            "count_date": usage["count_date"],
+        }
+    )
+
+
+class UsageInfo(BaseModel):
+    tier: str
+    messages_used: int
+    # None means unlimited (pro tier) — the frontend renders "X/10" only
+    # when this is set.
+    messages_limit: Optional[int] = None
+    resets_at: Optional[str] = None
+
+
+def _usage_info(usage: dict) -> UsageInfo:
+    is_pro = usage["tier"] == "pro"
+    return UsageInfo(
+        tier=usage["tier"],
+        messages_used=usage["message_count"],
+        messages_limit=None if is_pro else FREE_DAILY_MESSAGE_LIMIT,
+        resets_at=None if is_pro else _resets_at_utc(),
+    )
+
+
 class HistoryMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: str
@@ -163,6 +284,11 @@ class ChatResponse(BaseModel):
     response: str
     chart: Optional[str] = None
     sources: Optional[list[SourceInfo]] = None
+    # True only when this response IS the "you've hit today's limit" message
+    # — the frontend uses this to show the upgrade prompt instead of
+    # rendering `response` as a normal answer.
+    limit_reached: bool = False
+    usage: UsageInfo
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +349,24 @@ def health():
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(request: ChatRequest):
+def chat(request: ChatRequest, user_id: str = Depends(get_current_user_id)):
+    # Auth is required here (it wasn't before usage tracking existed) since
+    # enforcing a per-user limit requires knowing who the user is. The
+    # frontend already gates the whole chat page behind sign-in, so every
+    # real caller already has a token to send.
+    usage = get_usage(user_id)
+    if usage["tier"] != "pro" and usage["message_count"] >= FREE_DAILY_MESSAGE_LIMIT:
+        info = _usage_info(usage)
+        return ChatResponse(
+            response=(
+                f"You've reached today's free limit of {FREE_DAILY_MESSAGE_LIMIT} messages. "
+                "Upgrade to Pro for unlimited messages, or your limit resets at "
+                f"{info.resets_at} (UTC)."
+            ),
+            limit_reached=True,
+            usage=info,
+        )
+
     # bot_respond() in app.py always calls route_message(message, history)
     # with the CURRENT message already appended as history's last entry —
     # _prior_user_messages() relies on that (it slices off history[-1] as
@@ -249,11 +392,21 @@ def chat(request: ChatRequest):
             text_parts.append(str(part))
 
     response_text = "\n\n".join(text_parts)
+    # Counted after a successful response, not before — a request that hit
+    # the limit check above and got the "limit reached" message doesn't
+    # consume another slot.
+    updated_usage = increment_usage(user_id)
     return ChatResponse(
         response=response_text,
         chart=chart_b64,
         sources=_extract_sources(response_text),
+        usage=_usage_info(updated_usage),
     )
+
+
+@app.get("/usage", response_model=UsageInfo)
+def get_usage_endpoint(user_id: str = Depends(get_current_user_id)):
+    return _usage_info(get_usage(user_id))
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +421,6 @@ def chat(request: ChatRequest):
 CONVERSATIONS_TABLE_NAME = "sec-chatbot-conversations"
 MAX_CONVERSATIONS_PER_USER = 5
 
-_dynamodb = boto3.resource("dynamodb", region_name=COGNITO_REGION)
 _conversations_table = _dynamodb.Table(CONVERSATIONS_TABLE_NAME)
 
 
@@ -401,3 +553,70 @@ def remove_conversation(
 ):
     delete_conversation(user_id, conversation_id)
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Billing (Stripe test mode — see the module-level comment above).
+#
+# One-time payment, not a subscription: simpler to implement correctly for a
+# demo (no recurring billing, cancellation, or dunning to handle), and the
+# actual entitlement this grants — "tier": "pro" on the usage record — works
+# identically either way.
+#
+# Confirmation happens on redirect (the frontend calls POST /billing/confirm
+# with the session_id Stripe appends to success_url) rather than via a
+# webhook. A webhook is the more robust, production-grade pattern — it's the
+# only path guaranteed to fire even if the user closes the tab right after
+# paying — but it also requires registering a public endpoint + signing
+# secret in the Stripe Dashboard as a second setup step. For a demo app,
+# checking the session's own payment_status directly on redirect is simpler
+# and still correct: Stripe's session object is the source of truth either
+# way, this just reads it synchronously instead of waiting for a push.
+# ---------------------------------------------------------------------------
+
+
+class CheckoutSessionResponse(BaseModel):
+    checkout_url: str
+
+
+@app.post("/billing/create-checkout-session", response_model=CheckoutSessionResponse)
+def create_checkout_session(user_id: str = Depends(get_current_user_id)):
+    if not stripe.api_key or not STRIPE_PRICE_ID:
+        raise HTTPException(
+            status_code=500,
+            detail="Stripe is not configured on this server (STRIPE_SECRET_KEY / STRIPE_PRICE_ID missing).",
+        )
+    session = stripe.checkout.Session.create(
+        mode="payment",
+        payment_method_types=["card"],
+        line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+        # {CHECKOUT_SESSION_ID} is a literal template Stripe substitutes
+        # itself — not an f-string interpolation, hence the plain string.
+        success_url=f"{FRONTEND_URL}/chat?upgrade=success&session_id={{CHECKOUT_SESSION_ID}}",
+        cancel_url=f"{FRONTEND_URL}/chat?upgrade=cancelled",
+        # Round-trips our own user id through Stripe so /billing/confirm can
+        # verify the paid session actually belongs to the caller, not just
+        # that *some* session with this id was paid.
+        client_reference_id=user_id,
+    )
+    return CheckoutSessionResponse(checkout_url=session.url)
+
+
+class ConfirmCheckoutRequest(BaseModel):
+    session_id: str
+
+
+@app.post("/billing/confirm", response_model=UsageInfo)
+def confirm_checkout(request: ConfirmCheckoutRequest, user_id: str = Depends(get_current_user_id)):
+    try:
+        session = stripe.checkout.Session.retrieve(request.session_id)
+    except stripe.error.StripeError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid checkout session: {exc}") from exc
+
+    if session.client_reference_id != user_id:
+        raise HTTPException(status_code=403, detail="This checkout session does not belong to your account")
+    if session.payment_status != "paid":
+        raise HTTPException(status_code=400, detail="Payment has not completed for this session")
+
+    set_user_tier(user_id, "pro")
+    return _usage_info(get_usage(user_id))

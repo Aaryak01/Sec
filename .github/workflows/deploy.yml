@@ -59,16 +59,26 @@ jobs:
             --arg cohere "$COHERE_API_KEY" \
             --arg akid "$DYNAMODB_AWS_ACCESS_KEY_ID" \
             --arg sak "$DYNAMODB_AWS_SECRET_ACCESS_KEY" \
+            --arg stripe_key "$STRIPE_SECRET_KEY" \
+            --arg stripe_price "$STRIPE_PRICE_ID" \
             '[
               {name: "COHERE_API_KEY", value: $cohere},
               {name: "AWS_ACCESS_KEY_ID", value: $akid},
-              {name: "AWS_SECRET_ACCESS_KEY", value: $sak}
+              {name: "AWS_SECRET_ACCESS_KEY", value: $sak},
+              {name: "STRIPE_SECRET_KEY", value: $stripe_key},
+              {name: "STRIPE_PRICE_ID", value: $stripe_price}
             ]')
           echo "json=$json" >> "$GITHUB_OUTPUT"
         env:
           COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
           DYNAMODB_AWS_ACCESS_KEY_ID: ${{ secrets.DYNAMODB_AWS_ACCESS_KEY_ID }}
           DYNAMODB_AWS_SECRET_ACCESS_KEY: ${{ secrets.DYNAMODB_AWS_SECRET_ACCESS_KEY }}
+          # Always a Stripe TEST MODE secret key (sk_test_...) — see the
+          # comment in api.py above stripe.api_key. STRIPE_PRICE_ID is the
+          # Price ID of a test-mode Product created in the Stripe Dashboard
+          # for the Pro plan (one-time purchase, not a subscription).
+          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+          STRIPE_PRICE_ID: ${{ secrets.STRIPE_PRICE_ID }}
 
       - name: Deploy to ECS Express Mode
         uses: aws-actions/amazon-ecs-deploy-express-service@v1

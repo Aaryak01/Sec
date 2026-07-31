@@ -20,3 +20,6 @@ pyjwt[crypto]
 # AWS CLI credentials already configured on this machine for local dev. No
 # keys are stored here.
 boto3
+# Stripe TEST MODE only (usage-limit/Pro-upgrade feature) — see the
+# module-level comment in api.py above the stripe.api_key assignment.
+stripe
