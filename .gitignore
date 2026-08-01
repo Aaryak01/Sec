@@ -1,0 +1,47 @@
+# Monorepo root .gitignore — covers both /backend and /frontend, plus
+# anything at the top level. Keeping this in one place instead of two
+# per-folder files avoids the pattern drifting out of sync between them.
+
+# --- Environment / secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Backend (Python / FastAPI) ---
+__pycache__/
+*.pyc
+*.pyo
+*.db
+.python-version.local
+backend/checkpoints/
+backend/tokenizer/
+backend/gemini-for-claude-code/
+
+# --- Frontend (Next.js) ---
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+frontend/coverage/
+frontend/*.tsbuildinfo
+frontend/next-env.d.ts
+frontend/.vercel/
+
+# Amplify Gen 2 local artifacts (not part of the deployed app — see
+# frontend/README for context)
+frontend/.amplify/
+frontend/amplify_outputs*
+frontend/amplifyconfiguration*
+
+# --- Editor / OS ---
+.DS_Store
+*.pem
+.vscode/
+.idea/
+.claude/
+
+# --- Logs ---
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
