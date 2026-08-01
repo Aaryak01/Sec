@@ -1,0 +1,45 @@
+@import "tailwindcss";
+
+:root {
+  /* Fixed light palette — deliberately no dark-mode override block below.
+     "Warm luxury paper," not a theme that has a dark counterpart. */
+  --background: #faf1f4;
+  --card: #fff9fb;
+  --card-border: #e8dee5;
+
+  /* Headline / strong text and the primary-button surface share this value
+     on purpose — one navy, used as both ink and the button's own color. */
+  --foreground: #212145;
+  --accent: #212145;
+  --accent-hover: #2b2b59;
+  /* Button label color: the palette's own warm-white card tone, not a
+     stark #ffffff — stays inside the given palette rather than reaching
+     outside it for "just use white." */
+  --accent-foreground: #fff9fb;
+
+  /* Given directly this time (previously derived) — still checked: 5.1:1 on
+     --background, 5.4:1 on --card, comfortably past WCAG AA's 4.5:1. */
+  --muted-foreground: #67657c;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-card: var(--card);
+  --color-card-border: var(--card-border);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-foreground: var(--accent-foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  /* Barely-there radial wash between the page background and the card tone —
+     texture without a visible gradient edge, "luxury editorial," not a
+     flashy hero background. */
+  background: radial-gradient(ellipse 1600px 900px at 50% -10%, var(--card) 0%, var(--background) 55%) fixed;
+  color: var(--foreground);
+  font-family: var(--font-sans), Arial, Helvetica, sans-serif;
+}
