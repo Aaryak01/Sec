@@ -3,13 +3,20 @@ name: Build and deploy to ECS Express Mode
 # ECS Express Mode (unlike App Runner) doesn't build from source — it only
 # accepts an already-built image URI. This workflow is what replaces App
 # Runner's native "connect a GitHub repo, it builds the Dockerfile itself"
-# flow: on every push to master, build the image, push it to ECR, then point
+# flow: on every push to main, build the image, push it to ECR, then point
 # (or re-point) the Express Mode service at the new image. One-time AWS
 # setup this depends on (ECR repo, OIDC role, the two ECS roles) is in the
 # deployment checklist — this file alone isn't enough to deploy.
+#
+# This file MUST live at the repo root's .github/workflows/ (not
+# backend/.github/workflows/) — GitHub Actions only discovers workflows
+# there, even in a monorepo. The `paths: [backend/**]` filter below is what
+# keeps it scoped to backend changes; the build itself points its context at
+# ./backend since that's where the Dockerfile now lives.
 on:
   push:
-    branches: [master]
+    branches: [main]
+    paths: [backend/**]
 
 permissions:
   id-token: write # required for OIDC — no long-lived AWS keys stored in GitHub
@@ -34,7 +41,7 @@ jobs:
       - name: Build and push image
         uses: docker/build-push-action@v6
         with:
-          context: .
+          context: ./backend
           push: true
           tags: ${{ steps.ecr-login.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
 
