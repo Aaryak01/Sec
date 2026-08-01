@@ -1,0 +1,93 @@
+name: Build and deploy to ECS Express Mode
+
+# ECS Express Mode (unlike App Runner) doesn't build from source — it only
+# accepts an already-built image URI. This workflow is what replaces App
+# Runner's native "connect a GitHub repo, it builds the Dockerfile itself"
+# flow: on every push to master, build the image, push it to ECR, then point
+# (or re-point) the Express Mode service at the new image. One-time AWS
+# setup this depends on (ECR repo, OIDC role, the two ECS roles) is in the
+# deployment checklist — this file alone isn't enough to deploy.
+on:
+  push:
+    branches: [master]
+
+permissions:
+  id-token: write # required for OIDC — no long-lived AWS keys stored in GitHub
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/GitHubActionsECSDeployRole
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.ecr-login.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
+
+      # Builds the environment-variables JSON via jq instead of interpolating
+      # secrets directly into a hand-written JSON literal. The direct-
+      # interpolation version broke with "Bad control character in string
+      # literal" — a raw, unescaped newline from one of the secrets (almost
+      # certainly a trailing newline picked up when the value was copied
+      # in) landed inside a JSON string, which JSON doesn't allow literally.
+      # jq -cn --arg properly escapes whatever's in each value (newlines,
+      # quotes, backslashes) instead of assuming it's already JSON-safe, so
+      # this class of bug can't recur regardless of what a secret contains.
+      # This does NOT fix a value that's wrong at the source, though — if a
+      # secret really does have a stray trailing newline baked in, that
+      # newline is still part of the value delivered to the container's env
+      # var (just properly escaped in transit now) and should be fixed by
+      # re-entering the secret cleanly in GitHub repo settings.
+      - name: Build container environment variables JSON
+        id: env-json
+        run: |
+          json=$(jq -cn \
+            --arg cohere "$COHERE_API_KEY" \
+            --arg akid "$DYNAMODB_AWS_ACCESS_KEY_ID" \
+            --arg sak "$DYNAMODB_AWS_SECRET_ACCESS_KEY" \
+            --arg stripe_key "$STRIPE_SECRET_KEY" \
+            --arg stripe_price "$STRIPE_PRICE_ID" \
+            '[
+              {name: "COHERE_API_KEY", value: $cohere},
+              {name: "AWS_ACCESS_KEY_ID", value: $akid},
+              {name: "AWS_SECRET_ACCESS_KEY", value: $sak},
+              {name: "STRIPE_SECRET_KEY", value: $stripe_key},
+              {name: "STRIPE_PRICE_ID", value: $stripe_price}
+            ]')
+          echo "json=$json" >> "$GITHUB_OUTPUT"
+        env:
+          COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+          DYNAMODB_AWS_ACCESS_KEY_ID: ${{ secrets.DYNAMODB_AWS_ACCESS_KEY_ID }}
+          DYNAMODB_AWS_SECRET_ACCESS_KEY: ${{ secrets.DYNAMODB_AWS_SECRET_ACCESS_KEY }}
+          # Always a Stripe TEST MODE secret key (sk_test_...) — see the
+          # comment in api.py above stripe.api_key. STRIPE_PRICE_ID is the
+          # Price ID of a test-mode Product created in the Stripe Dashboard
+          # for the Pro plan (one-time purchase, not a subscription).
+          STRIPE_SECRET_KEY: ${{ secrets.STRIPE_SECRET_KEY }}
+          STRIPE_PRICE_ID: ${{ secrets.STRIPE_PRICE_ID }}
+
+      - name: Deploy to ECS Express Mode
+        uses: aws-actions/amazon-ecs-deploy-express-service@v1
+        with:
+          service-name: ${{ vars.ECS_SERVICE }}
+          cluster: ${{ vars.ECS_CLUSTER }}
+          image: ${{ steps.ecr-login.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
+          container-port: 8000
+          health-check-path: /health
+          execution-role-arn: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/ecsTaskExecutionRole
+          infrastructure-role-arn: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/ecsInfrastructureRoleForExpressServices
+          environment-variables: ${{ steps.env-json.outputs.json }}
