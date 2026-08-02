@@ -1,0 +1,5 @@
+# Shell scripts must keep LF line endings regardless of the checking-out
+# platform's core.autocrlf setting — a CRLF shebang line (`#!/usr/bin/env
+# bash\r`) fails to resolve the interpreter on Linux/macOS, and this repo's
+# local git config normalizes to CRLF on Windows checkout by default.
+*.sh text eol=lf

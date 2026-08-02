@@ -230,6 +230,53 @@ nothing in this repo can change them:
    them first would break the still-live deployments if anything above needs
    a rollback.
 
+## Cost management
+
+This is a portfolio demo, not a production service — there's no reason to
+pay for backend compute while nobody's using it. Two scripts in
+[`backend/scripts/`](backend/scripts/) scale the ECS Express Mode service's
+task count between 0 and 1 on demand:
+
+```bash
+./backend/scripts/stop-backend.sh    # scale to 0 — stops Fargate compute billing
+./backend/scripts/start-backend.sh   # scale back to 1, waits until /health responds
+```
+
+Both require the AWS CLI configured with credentials that can call
+`ecs:UpdateService` / `ecs:DescribeServices` on this cluster (the same CLI
+setup already used elsewhere in this project). Override the target via env
+vars if needed: `ECS_CLUSTER`, `ECS_SERVICE`, `AWS_REGION`,
+`BACKEND_HEALTH_URL`.
+
+**What this actually saves, honestly:** `desired-count 0` is a completely
+standard ECS operation — no service deletion or recreation involved, and
+it's what `stop-backend.sh` does. It stops 100% of Fargate compute billing
+(the task here is 1 vCPU / 2GB, the dominant cost for this project if left
+running 24/7). It does **not** stop the Express Mode gateway's Application
+Load Balancer, which has its own small fixed hourly charge regardless of
+whether any tasks are running behind it — so this isn't literally $0/hour
+when "off," just close to it. The alternative (fully deleting and
+recreating the service, e.g. by re-running the GitHub Actions deploy
+workflow from scratch each time) would also tear down and reprovision that
+ALB — which is slower, and risks the ALB's hostname changing, breaking the
+frontend's configured `NEXT_PUBLIC_API_URL` until it's updated to match.
+Scaling to zero avoids all of that for the cost of the ALB's fixed fee,
+which was judged the better trade for a demo project that gets started and
+stopped often.
+
+**Timing:** `start-backend.sh` waits for the ECS task to reach steady state,
+then polls `/health` until it responds — in testing, the full round trip
+(task start → steady state → `/health` responding) took **about 75-80
+seconds**, most of which is ECS/ALB health-check timing rather than the
+app itself; once the task is actually running, the app finishes loading its
+TF-IDF matrix over the filing chunks well within that window.
+
+**While stopped:** the frontend (Amplify) is still live and will load, but
+any chat request will fail — the Express Mode ALB returns a `503` with no
+healthy targets to route to. That's expected, not a bug; it's exactly what
+"the backend is intentionally off" looks like from the frontend's side, and
+`start-backend.sh` is the fix.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
