@@ -195,20 +195,18 @@ Console.
 These are **not** done yet and must be done by hand in the AWS Console —
 nothing in this repo can change them:
 
-1. **Amplify Hosting (frontend)** — Amplify's build settings currently point
-   at the old `sec-chatbot-web` repo with the app root at `/`. In the
-   Amplify Console, either:
-   - Reconnect the app to this new merged repo and set **App settings → Build
-     settings → App root directory** (or the monorepo package path setting,
-     depending on Amplify's current UI) to `frontend`, so it builds
-     `frontend/` instead of the repo root; or
-   - Create a fresh Amplify app pointed at this repo with that same root
-     directory set, if reconnecting an existing app to a new repo isn't
-     supported by the console.
+1. **Amplify Hosting (frontend)** — Amplify's build fails with `Cannot read
+   'next' version in package.json` until it knows the app root moved. Fix:
+   **App settings → Environment variables** → add
+   `AMPLIFY_MONOREPO_APP_ROOT` = `frontend` (all branches), then redeploy.
+   That's the officially documented monorepo variable — once set, Amplify
+   `cd`s into `frontend/` before running build commands, so `frontend/
+   amplify.yml`'s existing single-app spec (not the multi-app `applications:`
+   format) works unchanged, paths and all.
 
-   Amplify auto-detects Next.js build settings, but confirm the build
-   command still resolves to `frontend/` (e.g. `cd frontend && npm run
-   build` if it doesn't infer the subfolder correctly on its own).
+   No repo reconnection needed if Amplify is already pointed at whichever of
+   the two repos ended up hosting the monorepo (confirm in App settings →
+   General which repo/branch it's building from).
 
 2. **ECS / GitHub Actions (backend)** — the GitHub Actions OIDC role
    (`GitHubActionsECSDeployRole`) trusts a specific GitHub repo (and
