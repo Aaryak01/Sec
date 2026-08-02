@@ -195,14 +195,19 @@ Console.
 These are **not** done yet and must be done by hand in the AWS Console —
 nothing in this repo can change them:
 
-1. **Amplify Hosting (frontend)** — Amplify's build fails with `Cannot read
-   'next' version in package.json` until it knows the app root moved. Fix:
-   **App settings → Environment variables** → add
-   `AMPLIFY_MONOREPO_APP_ROOT` = `frontend` (all branches), then redeploy.
-   That's the officially documented monorepo variable — once set, Amplify
-   `cd`s into `frontend/` before running build commands, so `frontend/
-   amplify.yml`'s existing single-app spec (not the multi-app `applications:`
-   format) works unchanged, paths and all.
+1. **Amplify Hosting (frontend)** — two-part fix; the config half is already
+   committed, only the Console setting is on you:
+   - **Already done in this repo:** the build spec moved to a root-level
+     [`amplify.yml`](amplify.yml) using the monorepo `applications:` format
+     with `appRoot: frontend`. (A single-app spec at any location, including
+     inside `frontend/`, fails once Amplify is in monorepo mode with
+     `Monorepo spec provided without "applications" key` — confirmed by
+     hitting that exact error.)
+   - **Still manual:** **App settings → Environment variables** → add
+     `AMPLIFY_MONOREPO_APP_ROOT` = `frontend` (all branches), then redeploy.
+     Without this, Amplify still builds from the repo root and fails with
+     `Cannot read 'next' version in package.json` — also confirmed by
+     hitting that error before this variable was set.
 
    No repo reconnection needed if Amplify is already pointed at whichever of
    the two repos ended up hosting the monorepo (confirm in App settings →

@@ -1,0 +1,30 @@
+version: 1
+# Monorepo build spec — required at the repo root, in this "applications:"
+# format, once AMPLIFY_MONOREPO_APP_ROOT is set on the app (App settings →
+# Environment variables). A single-app spec (just a top-level `frontend:`
+# key) placed anywhere, including inside frontend/, fails once Amplify is
+# in monorepo mode with "Monorepo spec provided without 'applications' key"
+# — confirmed by hitting that exact error after moving amplify.yml into
+# frontend/ and setting only the env var.
+#
+# appRoot scopes every path below (build commands' cwd, artifacts
+# baseDirectory, cache paths) to frontend/ — they're written exactly as they
+# were in the old single-app spec, just nested here instead.
+applications:
+  - appRoot: frontend
+    frontend:
+      phases:
+        preBuild:
+          commands:
+            - npm ci
+        build:
+          commands:
+            - npm run build
+      artifacts:
+        baseDirectory: .next
+        files:
+          - '**/*'
+      cache:
+        paths:
+          - node_modules/**/*
+          - .next/cache/**/*
