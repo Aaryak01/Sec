@@ -98,6 +98,23 @@ persistence, and billing.
   `data/stock_prices.csv` offline; the app reads real historical prices and
   computed metrics from CSVs at request time, not a live market API call.
 
+## From-scratch transformer
+
+Before this app's RAG pipeline existed, its technical foundation was a
+GPT-style transformer built and trained entirely from scratch — tokenizer,
+attention, training loop, all of it — pretrained on Wikitext-103 and then
+fine-tuned on real SEC filings. That work now lives in its own repo:
+[**Transformer-from-scratch**](https://github.com/Aaryak01/Transformer-from-scratch)
+(33.5M parameters, full architecture + training notebooks with real
+captured outputs).
+
+Being honest about how the two connect, the same way the architecture
+section above is about the RAG pipeline: **this app's live responses come
+from the TF-IDF retrieval + Cohere pipeline described above, not from that
+from-scratch model.** The transformer repo is a separate, complete
+demonstration of building a language model from first principles; it isn't
+wired into this app's request path.
+
 ## Repo layout
 
 ```
