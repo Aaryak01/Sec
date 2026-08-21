@@ -23,3 +23,5 @@ boto3
 # Stripe TEST MODE only (usage-limit/Pro-upgrade feature) — see the
 # module-level comment in api.py above the stripe.api_key assignment.
 stripe
+# (no new dependency added here -- this comment only exists to trigger a
+# deploy under backend/** and verify the OIDC trust policy fix)
