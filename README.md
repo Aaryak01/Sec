@@ -11,6 +11,20 @@ answers grounded in the actual filing text or real market data — not
 guesses — with a Next.js chat UI, a FastAPI backend, and AWS-hosted auth,
 persistence, and billing.
 
+## 🔗 Live Demo
+
+**[main.d2xcvsauexn8dl.amplifyapp.com](https://main.d2xcvsauexn8dl.amplifyapp.com)**
+
+Being upfront about one thing before you click: the backend is
+intentionally scaled to zero between demos to avoid paying for idle
+compute (see [Cost management](#cost-management) below) — **if the chat
+doesn't respond, the backend most likely just needs a manual start.**
+Run [`backend/scripts/start-backend.sh`](backend/scripts/start-backend.sh)
+(needs AWS CLI access to this project's account) and wait **~75-80
+seconds** for it to come back online. The frontend loading fine while
+chat requests fail during that window is expected — that's what "backend
+intentionally off" looks like, not a bug.
+
 ## What it does
 
 - **Ask about real filings.** "What does Tesla say about supply chain risk?"
@@ -171,6 +185,17 @@ template answers and skipping persistence):
 | `COGNITO_USER_POOL_ID` / `COGNITO_APP_CLIENT_ID` / `COGNITO_REGION` | Override the default Cognito pool (defaults are baked in for this project's pool) |
 | `STRIPE_SECRET_KEY` / `STRIPE_PRICE_ID` | Stripe **test mode** keys for the Pro-upgrade flow |
 | `FRONTEND_URL` | Base URL for Stripe Checkout success/cancel redirects |
+
+**Auth note:** every endpoint except `/health` requires a valid Cognito
+access token (`Authorization: Bearer <token>`) — this is **not** one of
+the optional/gracefully-degrading env vars above, it's checked
+unconditionally via `Depends(get_current_user_id)` in `api.py`. Curling
+`/chat` directly with no token returns a 401, by design. Since the
+backend's default Cognito pool is the real one this project uses, the
+easiest way to get a real token for local testing is to run the frontend
+(below) against `http://localhost:3000` and sign up/sign in normally —
+that mints a real token the same way production does, rather than
+requiring you to mock Cognito.
 
 ### Frontend
 
