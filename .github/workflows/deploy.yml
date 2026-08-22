@@ -28,30 +28,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Temporary debug step: prints the actual OIDC ID token's claims
-      # (sub, aud, repository, ref) so the IAM trust policy's `sub`
-      # condition can be matched to what GitHub is really presenting,
-      # instead of guessing at the format. Same approach used earlier in
-      # this project's history when the App Runner -> ECS OIDC setup was
-      # first debugged. Decodes the JWT payload locally (base64url + JSON
-      # parse) -- never calls AWS, so this runs and prints regardless of
-      # whether the next step's AssumeRoleWithWebIdentity call succeeds.
-      - name: Debug -- print OIDC token claims
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const token = await core.getIDToken('sts.amazonaws.com');
-            const payload = token.split('.')[1];
-            const b64 = payload.replace(/-/g, '+').replace(/_/g, '/');
-            const json = Buffer.from(b64, 'base64').toString('utf8');
-            const claims = JSON.parse(json);
-            core.info('sub: ' + claims.sub);
-            core.info('aud: ' + JSON.stringify(claims.aud));
-            core.info('repository: ' + claims.repository);
-            core.info('repository_owner: ' + claims.repository_owner);
-            core.info('ref: ' + claims.ref);
-            core.info('workflow_ref: ' + claims.workflow_ref);
-
+      # Trust policy on GitHubActionsECSDeployRole must match this exact
+      # sub format -- this org/repo has GitHub's immutable-ID OIDC claims
+      # enabled, so the token's sub is
+      # repo:Aaryak01@224979162/Sec-Analyst-LLM@1315359009:ref:refs/heads/main,
+      # not the plain-name repo:Aaryak01/Sec-Analyst-LLM:* format most
+      # examples assume. Confirmed via a temporary debug step (decoded the
+      # real token's claims) after the plain-name format silently failed
+      # with a generic "Not authorized to perform sts:AssumeRoleWithWebIdentity"
+      # that gave no hint the format itself was the mismatch.
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5
         with:
